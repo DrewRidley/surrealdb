@@ -239,6 +239,14 @@ pub(crate) enum Error {
 	#[error("The query was not executed due to a cancelled transaction")]
 	QueryCancelled,
 
+	/// The query exceeded a resource budget.
+	#[error("The query exceeded the {resource} resource budget: used {used}, limit {limit}")]
+	QueryResourceExceeded {
+		resource: &'static str,
+		limit: u64,
+		used: u64,
+	},
+
 	/// The query did not execute, because the memory threshold has been reached
 	#[error("The query was not executed due to the memory threshold being reached")]
 	QueryBeyondMemoryThreshold,

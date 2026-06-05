@@ -129,6 +129,9 @@ pub fn into_types_error(error: Error) -> TypesError {
 			},
 		),
 		QueryCancelled => TypesError::query(message, QueryError::Cancelled),
+		QueryResourceExceeded {
+			..
+		} => TypesError::query(message, None),
 		QueryNotExecuted {
 			message,
 		} => TypesError::query(message, QueryError::NotExecuted),

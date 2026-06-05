@@ -50,6 +50,7 @@ pub mod env;
 pub mod err;
 pub mod exec;
 pub mod expr;
+pub mod gov;
 #[cfg(feature = "graphql")]
 pub mod gql;
 #[cfg(feature = "http")]
