@@ -42,6 +42,7 @@ use crate::dbs::{
 use crate::err::Error;
 use crate::exec::function::FunctionRegistry;
 use crate::expr::Base;
+use crate::gov::ResourceBudget;
 #[cfg(feature = "http")]
 use crate::http::HttpClient;
 use crate::iam::{Action, ResourceKind};
@@ -134,6 +135,8 @@ pub struct Context {
 	tenant_identity: Option<Arc<crate::observe::TenantIdentity>>,
 	// Matches context for index functions (search::highlight, search::score, etc.)
 	matches_context: Option<Arc<crate::exec::function::MatchesContext>>,
+	// Shared resource budget and usage counters for this query/request.
+	resource_budget: Option<Arc<ResourceBudget>>,
 	// KNN context for index functions (vector::distance::knn)
 	knn_context: Option<Arc<crate::exec::function::KnnContext>>,
 	/// Client for making http requests.
@@ -197,6 +200,7 @@ impl Context {
 			redact_volatile_explain_attrs: false,
 			statement_counters: None,
 			matches_context: None,
+			resource_budget: None,
 			knn_context: None,
 			config: Arc::clone(&parent.config),
 			#[cfg(feature = "http")]
@@ -255,6 +259,7 @@ impl Context {
 			redact_volatile_explain_attrs: parent.redact_volatile_explain_attrs,
 			statement_counters: parent.statement_counters.clone(),
 			matches_context: parent.matches_context.clone(),
+			resource_budget: parent.resource_budget.clone(),
 			knn_context: parent.knn_context.clone(),
 			config: Arc::clone(&parent.config),
 			#[cfg(feature = "http")]
@@ -299,6 +304,7 @@ impl Context {
 			redact_volatile_explain_attrs: parent.redact_volatile_explain_attrs,
 			statement_counters: parent.statement_counters.clone(),
 			matches_context: parent.matches_context.clone(),
+			resource_budget: parent.resource_budget.clone(),
 			knn_context: parent.knn_context.clone(),
 			config: Arc::clone(&parent.config),
 			#[cfg(feature = "http")]
@@ -360,6 +366,7 @@ impl Context {
 			redact_volatile_explain_attrs: from.redact_volatile_explain_attrs,
 			statement_counters: from.statement_counters.clone(),
 			matches_context: from.matches_context.clone(),
+			resource_budget: from.resource_budget.clone(),
 			knn_context: from.knn_context.clone(),
 			config: Arc::clone(&from.config),
 			#[cfg(feature = "http")]
@@ -412,6 +419,7 @@ impl Context {
 			redact_volatile_explain_attrs: from.redact_volatile_explain_attrs,
 			statement_counters: from.statement_counters.clone(),
 			matches_context: from.matches_context.clone(),
+			resource_budget: from.resource_budget.clone(),
 			knn_context: from.knn_context.clone(),
 			config: Arc::clone(&from.config),
 			#[cfg(feature = "http")]
@@ -473,6 +481,7 @@ impl Context {
 			redact_volatile_explain_attrs: false,
 			statement_counters: None,
 			matches_context: None,
+			resource_budget: None,
 			knn_context: None,
 			config,
 			#[cfg(feature = "http")]
@@ -520,6 +529,7 @@ impl Context {
 			redact_volatile_explain_attrs: false,
 			statement_counters: None,
 			matches_context: None,
+			resource_budget: None,
 			knn_context: None,
 			config: Default::default(),
 			#[cfg(feature = "http")]
@@ -538,6 +548,16 @@ impl Context {
 			live: false,
 			broker: None,
 		}
+	}
+
+	/// Returns the shared resource budget for this context, if one is installed.
+	pub(crate) fn resource_budget(&self) -> Option<&Arc<ResourceBudget>> {
+		self.resource_budget.as_ref()
+	}
+
+	/// Installs a shared resource budget on this context.
+	pub(crate) fn set_resource_budget(&mut self, budget: Arc<ResourceBudget>) {
+		self.resource_budget = Some(budget);
 	}
 
 	/// Freezes this context, allowing it to be used as a parent context.
@@ -1453,6 +1473,28 @@ mod tests {
 			r.err().unwrap().to_string(),
 			"Access to network target '127.0.0.1/32' is not allowed"
 		);
+	}
+
+	#[test]
+	fn context_budget_is_shared_with_children_and_snapshots() {
+		use std::sync::Arc;
+
+		use crate::gov::{ResourceBudget, ResourceKind as GovResourceKind};
+
+		let budget = Arc::new(ResourceBudget::monitor(Default::default()));
+		let mut ctx = Context::new_test();
+		ctx.set_resource_budget(Arc::clone(&budget));
+		let root = ctx.freeze();
+
+		root.resource_budget().unwrap().charge(GovResourceKind::ResultRow, 1).unwrap();
+
+		let child = Context::new_child(&root).freeze();
+		child.resource_budget().unwrap().charge(GovResourceKind::ResultRow, 2).unwrap();
+
+		let snapshot = Context::snapshot(&child).freeze();
+		snapshot.resource_budget().unwrap().charge(GovResourceKind::ResultRow, 3).unwrap();
+
+		assert_eq!(budget.usage().get(GovResourceKind::ResultRow), 6);
 	}
 
 	#[tokio::test]

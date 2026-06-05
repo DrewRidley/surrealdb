@@ -29,6 +29,7 @@ use crate::expr::paths::{DB, NS};
 use crate::expr::plan::LogicalPlan;
 use crate::expr::statements::{OptionStatement, UseStatement};
 use crate::expr::{Base, ControlFlow, Expr, FlowResult, TopLevelExpr};
+use crate::gov::{ResourceBudget, ResourceKind as GovResourceKind};
 use crate::iam::{Action, ResourceKind};
 use crate::kvs::slowlog::SlowLogVisit;
 use crate::kvs::{Datastore, LockType, Transaction, TransactionType};
@@ -522,8 +523,12 @@ impl Executor {
 		// Build the root context using cached session info. The context
 		// snapshot must be fresh per-query because it contains the
 		// transaction reference which changes between statements.
+		let mut ctx = Context::snapshot(&self.ctx);
+		if ctx.resource_budget().is_none() {
+			ctx.set_resource_budget(Arc::new(ResourceBudget::monitor(Default::default())));
+		}
 		let root_ctx = RootContext {
-			ctx: Context::snapshot(&self.ctx).freeze(),
+			ctx: ctx.freeze(),
 			options: Some(self.opt.clone()),
 			datastore: None,
 			cancellation,
@@ -607,6 +612,11 @@ impl Executor {
 		while let Some(batch_result) = stream.next().await {
 			match batch_result {
 				Ok(batch) => {
+					if let Some(budget) = exec_ctx.resource_budget() {
+						budget
+							.charge(GovResourceKind::ResultRow, batch.values.len() as u64)
+							.map_err(ControlFlow::Err)?;
+					}
 					results.extend(batch.values);
 				}
 				Err(crate::expr::ControlFlow::Err(e)) => {
