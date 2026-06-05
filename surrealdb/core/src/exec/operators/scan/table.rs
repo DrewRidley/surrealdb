@@ -9,7 +9,7 @@ use std::sync::Arc;
 use futures::StreamExt;
 use tracing::instrument;
 
-use super::common::resolve_version_stamp;
+use super::common::{charge_scanned_batch, resolve_version_stamp};
 use super::pipeline::{ScanPipeline, build_field_state, eval_limit_expr, kv_scan_stream};
 use super::resolved::ResolvedTableContext;
 use crate::exec::permission::{
@@ -271,6 +271,7 @@ impl ExecOperator for TableScan {
 					))?;
 				}
 				let mut batch = batch_result?;
+				charge_scanned_batch(ctx.resource_budget(), batch.values.len()).map_err(ControlFlow::Err)?;
 				let cont = pipeline.process_batch(&mut batch.values, &ctx).await?;
 				if !batch.values.is_empty() {
 					yield ValueBatch { values: batch.values };

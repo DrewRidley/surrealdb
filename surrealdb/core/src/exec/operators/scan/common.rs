@@ -9,6 +9,7 @@ use crate::catalog::providers::TableProvider;
 use crate::catalog::{DatabaseId, NamespaceId};
 use crate::exec::{ControlFlowExt, EvalContext, ExecutionContext, PhysicalExpr};
 use crate::expr::ControlFlow;
+use crate::gov::{ResourceBudget, ResourceKind as GovResourceKind};
 use crate::kvs::{CachePolicy, Transaction};
 use crate::val::{RecordId, RecordIdKey, Value};
 
@@ -18,6 +19,24 @@ use crate::val::{RecordId, RecordIdKey, Value};
 /// `SURREAL_SCAN_BATCH_SIZE`); this constant exists only as the
 /// documentation anchor for that default.
 pub(crate) const DEFAULT_SCAN_BATCH_SIZE: usize = 1000;
+
+/// Charge a batch read from a scan source to the active resource budget.
+///
+/// `ScanKey` records how much storage/index scan space the operator consumed;
+/// `RowRead` records how many candidate rows entered execution before
+/// permission and predicate filtering.
+pub(crate) fn charge_scanned_batch(
+	budget: Option<&Arc<ResourceBudget>>,
+	row_count: usize,
+) -> anyhow::Result<()> {
+	let Some(budget) = budget else {
+		return Ok(());
+	};
+	let rows = row_count as u64;
+	budget.charge(GovResourceKind::ScanKey, rows)?;
+	budget.charge(GovResourceKind::RowRead, rows)?;
+	Ok(())
+}
 
 /// Convert a [`Value`] to a [`RecordIdKey`] for use in key range construction.
 ///
@@ -274,4 +293,24 @@ pub(crate) async fn fetch_and_filter_records_batch(
 		values.push(value);
 	}
 	Ok(values)
+}
+
+#[cfg(test)]
+mod tests {
+	use std::sync::Arc;
+
+	use crate::gov::{ResourceBudget, ResourceKind, ResourceLimits};
+
+	use super::charge_scanned_batch;
+
+	#[test]
+	fn charge_scanned_batch_accounts_scan_and_row_reads() {
+		let budget = Arc::new(ResourceBudget::monitor(ResourceLimits::default()));
+
+		charge_scanned_batch(Some(&budget), 3).unwrap();
+
+		let usage = budget.usage();
+		assert_eq!(usage.get(ResourceKind::ScanKey), 3);
+		assert_eq!(usage.get(ResourceKind::RowRead), 3);
+	}
 }
