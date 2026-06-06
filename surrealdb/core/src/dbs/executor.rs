@@ -45,6 +45,17 @@ use crate::{catalog, err, expr, sql};
 
 const TARGET: &str = "surrealdb::core::dbs";
 
+#[derive(Debug)]
+struct RateLimitRequiresWrite;
+
+impl std::fmt::Display for RateLimitRequiresWrite {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("rate limit admission requires a writable transaction")
+	}
+}
+
+impl std::error::Error for RateLimitRequiresWrite {}
+
 struct PreparedBroker {
 	receiver: async_channel::Receiver<RoutedNotification>,
 	delivery: Arc<dyn MessageBroker>,
@@ -138,6 +149,9 @@ impl Executor {
 					policy_index,
 					bucket.to_sql(),
 				);
+				if !txn.writeable() {
+					return Err(ControlFlow::Err(anyhow::Error::new(RateLimitRequiresWrite)));
+				}
 				if !self
 					.ctx
 					.rate_limiter()
@@ -1173,7 +1187,7 @@ impl Executor {
 		plan: TopLevelExpr,
 	) -> Result<Value> {
 		self.broker_owned_by_executor = false;
-		let result = self.execute_plan_impl_inner(kvs, start, plan).await;
+		let result = self.execute_plan_impl_inner(kvs, start, plan, false).await;
 		if self.broker_owned_by_executor {
 			self.clear_broker();
 		}
@@ -1185,11 +1199,9 @@ impl Executor {
 		kvs: &Datastore,
 		start: &Instant,
 		plan: TopLevelExpr,
+		force_write: bool,
 	) -> Result<Value> {
-		// SELECT can be guarded by inline RATELIMIT policies. Distributed admission uses the
-		// KV store to update bucket state atomically, so SELECT statements need a writable
-		// statement transaction even when the query body itself is read-only.
-		let transaction_type = if matches!(plan, TopLevelExpr::Expr(Expr::Select(_))) {
+		let transaction_type = if force_write {
 			TransactionType::Write
 		} else if plan.read_only() {
 			TransactionType::Read
@@ -1205,6 +1217,7 @@ impl Executor {
 			matches!(transaction_type, TransactionType::Write),
 			kvs.live_query_broker(),
 		);
+		let retry_plan = matches!(transaction_type, TransactionType::Read).then(|| plan.clone());
 
 		let exec_result = match kvs.transaction_timeout() {
 			Some(timeout) => {
@@ -1254,6 +1267,12 @@ impl Executor {
 			}
 			Err(ControlFlow::Err(e)) => {
 				let _ = txn.cancel().await;
+				if e.downcast_ref::<RateLimitRequiresWrite>().is_some() {
+					if let Some(plan) = retry_plan {
+						return Box::pin(self.execute_plan_impl_inner(kvs, start, plan, true))
+							.await;
+					}
+				}
 				Err(e)
 			}
 		}
