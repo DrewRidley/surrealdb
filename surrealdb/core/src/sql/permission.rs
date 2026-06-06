@@ -55,7 +55,7 @@ pub enum PermissionKind {
 }
 
 impl PermissionKind {
-	fn as_str(&self) -> &str {
+	pub fn as_str(&self) -> &str {
 		match self {
 			PermissionKind::Select => "select",
 			PermissionKind::Create => "create",

@@ -22,8 +22,8 @@ use crate::sql::statements::define::{
 };
 use crate::sql::tokenizer::Tokenizer;
 use crate::sql::{
-	AccessType, DefineModuleStatement, Expr, Index, Kind, Literal, Param, Permission, Permissions,
-	Scoring, TableType, access_type, table_type,
+	AccessType, DefineModuleStatement, Expr, Index, Kind, Literal, Param, Permission,
+	PermissionKind, Permissions, RateLimit, Scoring, TableType, access_type, table_type,
 };
 #[cfg(feature = "surrealism")]
 use crate::sql::{ModuleExecutable, SiloExecutable, SurrealismExecutable};
@@ -31,6 +31,7 @@ use crate::syn::error::bail;
 use crate::syn::parser::mac::{expected, unexpected};
 use crate::syn::parser::{ParseResult, Parser};
 use crate::syn::token::{Token, TokenKind, t};
+use crate::types::PublicDuration;
 #[cfg(feature = "surrealism")]
 use crate::types::PublicFile;
 
@@ -43,6 +44,71 @@ fn is_identifier_token(parser: &Parser<'_>, token: Token, ident: &str) -> bool {
 }
 
 impl Parser<'_> {
+	async fn parse_ratelimits(
+		&mut self,
+		stk: &mut Stk,
+		allow_delete: bool,
+	) -> ParseResult<Vec<RateLimit>> {
+		expected!(self, t!("FOR"));
+		let mut actions = Vec::new();
+		loop {
+			let token = self.next();
+			let action = match token.kind {
+				t!("SELECT") => PermissionKind::Select,
+				t!("CREATE") => PermissionKind::Create,
+				t!("UPDATE") => PermissionKind::Update,
+				t!("DELETE") if allow_delete => PermissionKind::Delete,
+				t!("DELETE") => unexpected!(self, token, "one of `SELECT`, `CREATE` or `UPDATE`"),
+				_ => unexpected!(self, token, "one of `SELECT`, `CREATE`, `UPDATE` or `DELETE`"),
+			};
+			actions.push(action);
+			if !self.eat(t!(",")) {
+				break;
+			}
+		}
+
+		let condition = if self.eat(t!("WHERE")) {
+			Some(stk.run(|ctx| self.parse_expr_field(ctx)).await?)
+		} else {
+			None
+		};
+
+		expected!(self, t!("BY"));
+		let bucket = stk.run(|ctx| self.parse_expr_field(ctx)).await?;
+
+		expected!(self, t!("LIMIT"));
+		let limit = self.next_token_value::<u64>()?;
+		expected!(self, t!("PER"));
+		let period = self.next_token_value::<PublicDuration>()?;
+
+		let burst = if self.eat(t!("BURST")) {
+			Some(self.next_token_value::<u64>()?)
+		} else {
+			None
+		};
+		let scan = if self.eat(t!("SCAN")) {
+			Some(self.next_token_value::<u64>()?)
+		} else {
+			None
+		};
+		let result = if self.eat(t!("RESULT")) {
+			Some(self.next_token_value::<u64>()?)
+		} else {
+			None
+		};
+
+		Ok(vec![RateLimit {
+			actions,
+			condition,
+			bucket,
+			limit,
+			period,
+			burst,
+			scan,
+			result,
+		}])
+	}
+
 	pub(crate) async fn parse_define_stmt(
 		&mut self,
 		stk: &mut Stk,
@@ -704,6 +770,10 @@ impl Parser<'_> {
 					self.pop_peek();
 					res.permissions = stk.run(|stk| self.parse_permission(stk, false)).await?;
 				}
+				t!("RATELIMIT") => {
+					self.pop_peek();
+					res.ratelimits.extend(self.parse_ratelimits(stk, true).await?);
+				}
 				t!("CHANGEFEED") => {
 					self.pop_peek();
 					res.changefeed = Some(self.parse_changefeed()?);
@@ -1012,6 +1082,10 @@ impl Parser<'_> {
 				t!("PERMISSIONS") => {
 					self.pop_peek();
 					res.permissions = stk.run(|ctx| self.parse_permission(ctx, true)).await?;
+				}
+				t!("RATELIMIT") => {
+					self.pop_peek();
+					res.ratelimits.extend(self.parse_ratelimits(stk, false).await?);
 				}
 				t!("COMMENT") => {
 					self.pop_peek();
