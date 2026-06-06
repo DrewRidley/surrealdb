@@ -22,6 +22,7 @@ use crate::exec::{
 	OutputOrdering, PhysicalExpr, ValueBatch, ValueBatchStream, monitor_stream,
 };
 use crate::expr::{ControlFlow, ControlFlowExt};
+use crate::gov::ChargeOutcome;
 use crate::iam::Action;
 use crate::idx::planner::ScanDirection;
 use crate::key::record;
@@ -271,7 +272,13 @@ impl ExecOperator for TableScan {
 					))?;
 				}
 				let mut batch = batch_result?;
-				charge_scanned_batch(ctx.resource_budget(), batch.values.len()).map_err(ControlFlow::Err)?;
+				let charge = match charge_scanned_batch(ctx.resource_budget(), batch.values.len()) {
+					Ok(outcome) => outcome,
+					Err(e) => Err(ControlFlow::Err(e))?,
+				};
+				if matches!(charge, ChargeOutcome::Truncated(_)) {
+					break;
+				}
 				let cont = pipeline.process_batch(&mut batch.values, &ctx).await?;
 				if !batch.values.is_empty() {
 					yield ValueBatch { values: batch.values };

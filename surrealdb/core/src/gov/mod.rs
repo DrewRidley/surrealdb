@@ -7,5 +7,5 @@
 mod budget;
 mod usage;
 
-pub use budget::{EnforcementMode, ResourceBudget, ResourceLimits};
+pub use budget::{ChargeOutcome, EnforcementMode, ResourceBudget, ResourceLimits};
 pub use usage::{ResourceKind, ResourceUsageSnapshot};

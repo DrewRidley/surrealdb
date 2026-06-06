@@ -20,7 +20,9 @@ use crate::catalog::providers::{
 use crate::ctx::reason::Reason;
 use crate::ctx::{Context, FrozenContext};
 use crate::dbs::response::QueryResult;
-use crate::dbs::{Force, MessageBroker, Options, QueryType, RoutedNotification, StatementCounters};
+use crate::dbs::{
+	Force, MessageBroker, Options, PartialReason, QueryType, RoutedNotification, StatementCounters,
+};
 use crate::doc::DefaultBroker;
 use crate::err::Error;
 use crate::exec::planner::try_plan_expr;
@@ -64,6 +66,23 @@ pub struct Executor {
 }
 
 impl Executor {
+	fn partial_reason_for_result(&self, is_error: bool) -> Option<PartialReason> {
+		let truncated = self.ctx.resource_budget().and_then(|budget| budget.take_truncated_kind());
+		if is_error {
+			return None;
+		}
+		match truncated {
+			Some(GovResourceKind::ScanKey) => Some(PartialReason::ScanLimit),
+			_ => None,
+		}
+	}
+
+	fn set_partial_truncation_allowed(&self, allowed: bool) {
+		if let Some(budget) = self.ctx.resource_budget() {
+			budget.set_truncation_allowed(allowed);
+		}
+	}
+
 	/// Install a per-statement notification broker when `writable` is true and the session has
 	/// notifications enabled. Read-only bare statements skip installation — they cannot emit
 	/// LIVE/KILL notifications — avoiding allocation and stale-broker leaks on the hot path.
@@ -1559,10 +1578,11 @@ impl Executor {
 					// surface affected-row counts independently of the
 					// post-RETURN value shape.
 					let counters = self.install_statement_counters();
-					let r: Result<Value> = match self
-						.execute_plan_in_transaction(Arc::clone(&txn), &before, plan)
-						.await
-					{
+					self.set_partial_truncation_allowed(statement_read_only);
+					let execution =
+						self.execute_plan_in_transaction(Arc::clone(&txn), &before, plan).await;
+					self.set_partial_truncation_allowed(false);
+					let r: Result<Value> = match execution {
 						Ok(x) => Ok(x),
 						Err(ControlFlow::Return(value)) => {
 							skip_remaining = true;
@@ -1690,9 +1710,9 @@ impl Executor {
 
 			self.results.push(QueryResult {
 				time: before.elapsed(),
+				partial: self.partial_reason_for_result(result.is_err()),
 				result,
 				query_type,
-				partial: None,
 			});
 		}
 

@@ -9,7 +9,7 @@ use crate::catalog::providers::TableProvider;
 use crate::catalog::{DatabaseId, NamespaceId};
 use crate::exec::{ControlFlowExt, EvalContext, ExecutionContext, PhysicalExpr};
 use crate::expr::ControlFlow;
-use crate::gov::{ResourceBudget, ResourceKind as GovResourceKind};
+use crate::gov::{ChargeOutcome, ResourceBudget, ResourceKind as GovResourceKind};
 use crate::kvs::{CachePolicy, Transaction};
 use crate::val::{RecordId, RecordIdKey, Value};
 
@@ -28,14 +28,17 @@ pub(crate) const DEFAULT_SCAN_BATCH_SIZE: usize = 1000;
 pub(crate) fn charge_scanned_batch(
 	budget: Option<&Arc<ResourceBudget>>,
 	row_count: usize,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ChargeOutcome> {
 	let Some(budget) = budget else {
-		return Ok(());
+		return Ok(ChargeOutcome::Charged);
 	};
 	let rows = row_count as u64;
-	budget.charge(GovResourceKind::ScanKey, rows)?;
+	let outcome = budget.charge_or_truncate(GovResourceKind::ScanKey, rows)?;
+	if matches!(outcome, ChargeOutcome::Truncated(_)) {
+		return Ok(outcome);
+	}
 	budget.charge(GovResourceKind::RowRead, rows)?;
-	Ok(())
+	Ok(ChargeOutcome::Charged)
 }
 
 /// Convert a [`Value`] to a [`RecordIdKey`] for use in key range construction.
@@ -299,7 +302,7 @@ pub(crate) async fn fetch_and_filter_records_batch(
 mod tests {
 	use std::sync::Arc;
 
-	use crate::gov::{ResourceBudget, ResourceKind, ResourceLimits};
+	use crate::gov::{ChargeOutcome, ResourceBudget, ResourceKind, ResourceLimits};
 
 	use super::charge_scanned_batch;
 
@@ -307,10 +310,24 @@ mod tests {
 	fn charge_scanned_batch_accounts_scan_and_row_reads() {
 		let budget = Arc::new(ResourceBudget::monitor(ResourceLimits::default()));
 
-		charge_scanned_batch(Some(&budget), 3).unwrap();
+		assert_eq!(charge_scanned_batch(Some(&budget), 3).unwrap(), ChargeOutcome::Charged);
 
 		let usage = budget.usage();
 		assert_eq!(usage.get(ResourceKind::ScanKey), 3);
 		assert_eq!(usage.get(ResourceKind::RowRead), 3);
+	}
+
+	#[test]
+	fn charge_scanned_batch_truncates_on_scan_limit() {
+		let budget = Arc::new(ResourceBudget::enforcing(
+			ResourceLimits::default().with_limit(ResourceKind::ScanKey, 2),
+		));
+		budget.set_truncation_allowed(true);
+
+		assert_eq!(
+			charge_scanned_batch(Some(&budget), 3).unwrap(),
+			ChargeOutcome::Truncated(ResourceKind::ScanKey)
+		);
+		assert_eq!(budget.truncated_kind(), Some(ResourceKind::ScanKey));
 	}
 }
