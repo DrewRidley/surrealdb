@@ -60,6 +60,17 @@ impl QueryType {
 	}
 }
 
+#[revisioned(revision = 1)]
+#[derive(
+	Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, SurrealValue,
+)]
+#[surreal(crate = "surrealdb_types")]
+#[surreal(untagged, rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum PartialReason {
+	ScanLimit,
+}
+
 /// The return value when running a query set on the database.
 #[derive(Debug, Clone)]
 pub struct QueryResult {
@@ -68,6 +79,7 @@ pub struct QueryResult {
 	// Record the query type in case processing the response is necessary (such as tracking live
 	// queries).
 	pub query_type: QueryType,
+	pub partial: Option<PartialReason>,
 }
 
 impl QueryResult {
@@ -129,6 +141,12 @@ impl SurrealValue for QueryResult {
 				result: any,
 				query_type: (QueryType::kind_of()),
 			} | {
+				status: "PARTIAL",
+				reason: (PartialReason::kind_of()),
+				time: string,
+				result: any,
+				query_type: (QueryType::kind_of()),
+			} | {
 				status: "ERR",
 				time: string,
 				result: string,
@@ -150,10 +168,13 @@ impl SurrealValue for QueryResult {
 
 	fn into_value(self) -> Value {
 		let mut map = object! {
-			status: Status::from(&self.result).into_value(),
+			status: Status::from_result_and_partial(&self.result, self.partial).into_value(),
 			time: format!("{:?}", self.time).into_value(),
 			type: self.query_type.into_value(),
 		};
+		if let Some(partial) = self.partial {
+			map.insert("reason", partial.into_value());
+		}
 		match self.result {
 			Ok(v) => {
 				map.insert("result", v);
@@ -201,6 +222,15 @@ impl SurrealValue for QueryResult {
 		let status = Status::from_value(status)?;
 		let query_type =
 			map.remove("type").map(QueryType::from_value).transpose()?.unwrap_or_default();
+		let partial = match status {
+			Status::Partial => Some(
+				map.remove("reason")
+					.map(PartialReason::from_value)
+					.transpose()?
+					.unwrap_or(PartialReason::ScanLimit),
+			),
+			Status::Ok | Status::Err => None,
+		};
 
 		let time = humantime::parse_duration(&time.into_string().map_err(|e| {
 			TypesError::serialization(e.to_string(), SerializationError::Deserialization)
@@ -212,7 +242,7 @@ impl SurrealValue for QueryResult {
 		// Grab result based on status
 
 		let result = match status {
-			Status::Ok => Ok(Value::from_value(result)?),
+			Status::Ok | Status::Partial => Ok(Value::from_value(result)?),
 			Status::Err => {
 				map.insert("result".to_string(), result);
 				Err(from_query_result_value(Value::Object(map))?)
@@ -223,6 +253,7 @@ impl SurrealValue for QueryResult {
 			time,
 			result,
 			query_type,
+			partial,
 		})
 	}
 }
@@ -247,6 +278,7 @@ impl QueryResultBuilder {
 			time: Duration::ZERO,
 			result: Ok(Value::None),
 			query_type: QueryType::Other,
+			partial: None,
 		}
 	}
 
@@ -265,6 +297,7 @@ impl QueryResultBuilder {
 			time: self.start_time.elapsed(),
 			result: self.result,
 			query_type: self.query_type,
+			partial: None,
 		}
 	}
 
@@ -273,6 +306,7 @@ impl QueryResultBuilder {
 			time: self.start_time.elapsed(),
 			result,
 			query_type: self.query_type,
+			partial: None,
 		}
 	}
 }
@@ -284,6 +318,7 @@ impl QueryResultBuilder {
 #[surreal(untagged, uppercase)]
 pub enum Status {
 	Ok,
+	Partial,
 	Err,
 }
 
@@ -294,6 +329,17 @@ impl Status {
 
 	pub fn is_err(&self) -> bool {
 		matches!(self, Status::Err)
+	}
+
+	fn from_result_and_partial<T, E>(
+		result: &Result<T, E>,
+		partial: Option<PartialReason>,
+	) -> Self {
+		match (result, partial) {
+			(Ok(_), Some(_)) => Status::Partial,
+			(Ok(_), None) => Status::Ok,
+			(Err(_), _) => Status::Err,
+		}
 	}
 }
 
@@ -337,6 +383,7 @@ mod tests {
 			time: Duration::from_millis(42),
 			result: Err(error),
 			query_type: QueryType::Other,
+			partial: None,
 		}
 	}
 
@@ -440,11 +487,50 @@ mod tests {
 			time: Duration::from_millis(10),
 			result: Ok(Value::String("hello".to_string())),
 			query_type: QueryType::Other,
+			partial: None,
 		};
 		let val = qr.into_value();
 		let parsed = QueryResult::from_value(val).expect("round-trip should succeed");
 
 		let v = parsed.result.unwrap();
 		assert_eq!(v, Value::String("hello".to_string()));
+		assert_eq!(parsed.partial, None);
+	}
+
+	#[test]
+	fn query_result_partial_scan_limit_serializes_with_rows() {
+		let qr = QueryResult {
+			time: Duration::from_millis(10),
+			result: Ok(Value::from_vec(vec![Value::String("row".to_string())])),
+			query_type: QueryType::Other,
+			partial: Some(PartialReason::ScanLimit),
+		};
+
+		let val = qr.into_value();
+		let Value::Object(ref obj) = val else {
+			panic!("Expected object");
+		};
+
+		assert_eq!(obj.get("status"), Some(&Value::String("PARTIAL".to_string())));
+		assert_eq!(obj.get("reason"), Some(&Value::String("scan_limit".to_string())));
+		assert!(obj.get("result").is_some(), "partial responses must keep useful rows");
+	}
+
+	#[test]
+	fn query_result_partial_scan_limit_round_trip_keeps_result_ok() {
+		let qr = QueryResult {
+			time: Duration::from_millis(10),
+			result: Ok(Value::from_vec(vec![Value::String("row".to_string())])),
+			query_type: QueryType::Other,
+			partial: Some(PartialReason::ScanLimit),
+		};
+
+		let parsed = QueryResult::from_value(qr.into_value()).expect("round-trip should succeed");
+
+		assert_eq!(parsed.partial, Some(PartialReason::ScanLimit));
+		assert!(
+			parsed.result.is_ok(),
+			"partial responses are useful successful results, not errors"
+		);
 	}
 }

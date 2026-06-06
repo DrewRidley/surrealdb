@@ -1143,6 +1143,7 @@ impl Executor {
 						Some(QueryError::NotExecuted),
 					)),
 					query_type: QueryType::Other,
+					partial: None,
 				});
 				self.emit_statement_event_unexecuted(
 					kvs,
@@ -1279,6 +1280,7 @@ impl Executor {
 									),
 								}),
 								query_type: QueryType::Other,
+								partial: None,
 							});
 							self.emit_statement_event_unexecuted(kvs, kind, cancel_class);
 							return Ok(());
@@ -1301,6 +1303,7 @@ impl Executor {
 								time: Duration::ZERO,
 								result,
 								query_type: QueryType::Other,
+								partial: None,
 							});
 							self.emit_statement_event_unexecuted(kvs, kind, cancel_class);
 							if matches!(stmt, TopLevelExpr::Cancel) {
@@ -1363,6 +1366,7 @@ impl Executor {
 								.to_string(),
 						)),
 						query_type: QueryType::Other,
+						partial: None,
 					});
 
 					self.emit_statement_event_cached(
@@ -1389,6 +1393,7 @@ impl Executor {
 										Some(QueryError::NotExecuted),
 									)),
 									query_type: QueryType::Other,
+									partial: None,
 								});
 								return Ok(());
 							}
@@ -1403,6 +1408,7 @@ impl Executor {
 										Some(QueryError::NotExecuted),
 									)),
 									query_type: QueryType::Other,
+									partial: None,
 								});
 								if matches!(stmt, TopLevelExpr::Cancel) {
 									return Ok(());
@@ -1431,6 +1437,7 @@ impl Executor {
 						time: before.elapsed(),
 						result: Ok(convert_value_to_public_value(Value::None)?),
 						query_type: QueryType::Other,
+						partial: None,
 					});
 
 					self.emit_statement_event_cached(
@@ -1465,6 +1472,7 @@ impl Executor {
 							time: before.elapsed(),
 							result: Ok(convert_value_to_public_value(Value::None)?),
 							query_type: QueryType::Other,
+							partial: None,
 						});
 
 						self.emit_statement_event_cached(
@@ -1499,6 +1507,7 @@ impl Executor {
 							Some(QueryError::NotExecuted),
 						)),
 						query_type: QueryType::Other,
+						partial: None,
 					});
 
 					// `Cannot COMMIT` surfaces as a NotExecuted query error on
@@ -1525,6 +1534,7 @@ impl Executor {
 							time: before.elapsed(),
 							result: Ok(convert_value_to_public_value(Value::None)?),
 							query_type: QueryType::Other,
+							partial: None,
 						});
 						self.emit_statement_event_cached(
 							kvs,
@@ -1584,6 +1594,7 @@ impl Executor {
 								time: before.elapsed(),
 								result: Err(typed_err),
 								query_type,
+								partial: None,
 							});
 
 							self.emit_statement_event_cached(
@@ -1615,6 +1626,7 @@ impl Executor {
 													Some(QueryError::NotExecuted),
 												)),
 												query_type: QueryType::Other,
+												partial: None,
 											});
 										return Ok(());
 									}
@@ -1630,6 +1642,7 @@ impl Executor {
 													Some(QueryError::Cancelled),
 												)),
 												query_type: QueryType::Other,
+												partial: None,
 											});
 									}
 								}
@@ -1679,6 +1692,7 @@ impl Executor {
 				time: before.elapsed(),
 				result,
 				query_type,
+				partial: None,
 			});
 		}
 
@@ -1746,16 +1760,19 @@ impl Executor {
 					result: crate::val::convert_value_to_public_value(value)
 						.map_err(|e| TypesError::internal(e.to_string())),
 					query_type: QueryType::Other,
+					partial: None,
 				},
 				Err(ControlFlow::Err(e)) => QueryResult {
 					time,
 					result: Err(types_error_from_anyhow(e)),
 					query_type: QueryType::Other,
+					partial: None,
 				},
 				Err(ControlFlow::Continue) | Err(ControlFlow::Break) => QueryResult {
 					time,
 					result: Err(TypesError::internal("Invalid control flow".to_string())),
 					query_type: QueryType::Other,
+					partial: None,
 				},
 			};
 			let outcome = Outcome::from(&query_result.result);
@@ -1885,6 +1902,7 @@ impl Executor {
 						time: Duration::ZERO,
 						result: Err(TypesError::internal(e.to_string())),
 						query_type: QueryType::Other,
+						partial: None,
 					});
 
 					this.emit_query_event_for_results(
@@ -1941,6 +1959,7 @@ impl Executor {
 							time: Duration::ZERO,
 							result: Ok(convert_value_to_public_value(Value::None)?),
 							query_type: QueryType::Other,
+							partial: None,
 						});
 					}
 				}
@@ -1950,6 +1969,7 @@ impl Executor {
 							time: Duration::ZERO,
 							result: Ok(convert_value_to_public_value(Value::None)?),
 							query_type: QueryType::Other,
+							partial: None,
 						});
 					}
 
@@ -1983,6 +2003,7 @@ impl Executor {
 							time: Duration::ZERO,
 							result: Err(types_error_from_anyhow(e)),
 							query_type: QueryType::Other,
+							partial: None,
 						});
 
 						this.emit_query_event_for_results(
@@ -2028,6 +2049,7 @@ impl Executor {
 								time: start.elapsed(),
 								result: Err(types_error_from_anyhow(err)),
 								query_type,
+								partial: None,
 							});
 						}
 					} else {
@@ -2039,6 +2061,7 @@ impl Executor {
 							time: start.elapsed(),
 							result,
 							query_type,
+							partial: None,
 						});
 					}
 				}
