@@ -156,7 +156,8 @@ where
 			for (index, result) in results.into_iter().enumerate() {
 				let stats = DbResultStats::default()
 					.with_execution_time(result.time)
-					.with_query_type(result.query_type);
+					.with_query_type(result.query_type)
+					.with_optional_partial_reason(result.partial);
 
 				match result.query_type {
 					QueryType::Other => {
@@ -453,7 +454,7 @@ impl IndexedResults {
 	/// # Examples
 	///
 	/// ```no_run
-	/// 
+	///
 	/// # #[tokio::main]
 	/// # async fn main() -> surrealdb::Result<()> {
 	/// # let db = surrealdb::engine::any::connect("mem://").await?;
@@ -484,7 +485,7 @@ impl IndexedResults {
 	/// # Examples
 	///
 	/// ```no_run
-	/// 
+	///
 	/// # #[tokio::main]
 	/// # async fn main() -> surrealdb::Result<()> {
 	/// # let db = surrealdb::engine::any::connect("mem://").await?;
@@ -514,7 +515,7 @@ impl IndexedResults {
 	/// # Examples
 	///
 	/// ```no_run
-	/// 
+	///
 	/// # #[tokio::main]
 	/// # async fn main() -> surrealdb::Result<()> {
 	/// # let db = surrealdb::engine::any::connect("mem://").await?;
@@ -596,6 +597,7 @@ impl WithStats<IndexedResults> {
 		let db_stats = index.stats(&self.0)?;
 		let stats = Stats {
 			execution_time: db_stats.execution_time,
+			partial_reason: db_stats.partial_reason,
 		};
 		let result = index.query_result(&mut self.0);
 		Some((stats, result))
@@ -610,7 +612,7 @@ impl WithStats<IndexedResults> {
 	/// # Examples
 	///
 	/// ```no_run
-	/// 
+	///
 	/// # #[tokio::main]
 	/// # async fn main() -> surrealdb::Result<()> {
 	/// # let db = surrealdb::engine::any::connect("mem://").await?;
@@ -631,6 +633,7 @@ impl WithStats<IndexedResults> {
 			if let Some((db_stats, Err(error))) = self.0.results.swap_remove(&key) {
 				let stats = Stats {
 					execution_time: db_stats.execution_time,
+					partial_reason: db_stats.partial_reason,
 				};
 				errors.insert(key, (stats, error));
 			}
@@ -644,7 +647,7 @@ impl WithStats<IndexedResults> {
 	/// # Examples
 	///
 	/// ```no_run
-	/// 
+	///
 	/// # #[tokio::main]
 	/// # async fn main() -> surrealdb::Result<()> {
 	/// # let db = surrealdb::engine::any::connect("mem://").await?;
@@ -663,7 +666,7 @@ impl WithStats<IndexedResults> {
 	/// # Examples
 	///
 	/// ```no_run
-	/// 
+	///
 	/// # #[tokio::main]
 	/// # async fn main() -> surrealdb::Result<()> {
 	/// # let db = surrealdb::engine::any::connect("mem://").await?;
@@ -716,6 +719,25 @@ mod tests {
 			})
 			.enumerate()
 			.collect()
+	}
+
+	#[test]
+	fn with_stats_take_exposes_partial_reason() {
+		let stats = DbResultStats::default().with_partial_reason(crate::PartialReason::ScanLimit);
+		let mut response = WithStats(IndexedResults {
+			results: IndexMap::from([(
+				0,
+				(stats, Ok(Value::from_vec(vec![Value::from_bool(true)]))),
+			)]),
+			..IndexedResults::new()
+		});
+
+		let Some((stats, result)) = response.take::<Vec<bool>>(0) else {
+			panic!("statement not found");
+		};
+
+		assert_eq!(result.unwrap(), vec![true]);
+		assert_eq!(stats.partial_reason, Some(crate::PartialReason::ScanLimit));
 	}
 
 	#[test]

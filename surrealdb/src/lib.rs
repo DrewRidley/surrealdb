@@ -51,6 +51,8 @@ pub use method::Stream;
 #[doc(inline)]
 pub use method::query::IndexedResults;
 #[doc(inline)]
+pub use surrealdb_core::dbs::PartialReason;
+#[doc(inline)]
 pub use surrealdb_types as types;
 
 #[doc(inline)]

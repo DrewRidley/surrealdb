@@ -5,7 +5,7 @@ use surrealdb_types::{Error as TypesError, kind, object};
 use uuid::Uuid;
 
 use crate::dbs;
-use crate::dbs::{QueryResult, QueryType};
+use crate::dbs::{PartialReason, QueryResult, QueryType};
 use crate::rpc::request::SESSION_ID;
 use crate::types::{
 	PublicArray, PublicKind, PublicNotification, PublicObject, PublicValue, SurrealValue,
@@ -20,6 +20,7 @@ pub struct DbResultStats {
 	/// Note: This comes from the `time` field of the [`crate::dbs::QueryResult`] struct.
 	pub execution_time: Option<Duration>,
 	pub query_type: Option<QueryType>,
+	pub partial_reason: Option<PartialReason>,
 }
 
 impl DbResultStats {
@@ -30,6 +31,16 @@ impl DbResultStats {
 
 	pub fn with_query_type(mut self, query_type: QueryType) -> Self {
 		self.query_type = Some(query_type);
+		self
+	}
+
+	pub fn with_partial_reason(mut self, partial_reason: PartialReason) -> Self {
+		self.partial_reason = Some(partial_reason);
+		self
+	}
+
+	pub fn with_optional_partial_reason(mut self, partial_reason: Option<PartialReason>) -> Self {
+		self.partial_reason = partial_reason;
 		self
 	}
 }
