@@ -247,6 +247,12 @@ pub(crate) enum Error {
 		used: u64,
 	},
 
+	/// The query exceeded a configured rate limit.
+	#[error("The query exceeded the rate limit for {scope}")]
+	RateLimitExceeded {
+		scope: String,
+	},
+
 	/// The query did not execute, because the memory threshold has been reached
 	#[error("The query was not executed due to the memory threshold being reached")]
 	QueryBeyondMemoryThreshold,

@@ -300,6 +300,7 @@ impl Builder {
 			temporary_directory: self.temporary_directory,
 			cache: Arc::new(DatastoreCache::new(config.datastore_cache_size)),
 			function_registry: Arc::new(FunctionRegistry::with_builtins()),
+			rate_limiter: Arc::new(crate::gov::RateLimiter::default()),
 			buckets,
 			sequences: Sequences::new(tf, id),
 			async_event_trigger,

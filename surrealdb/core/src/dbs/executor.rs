@@ -89,8 +89,8 @@ impl Executor {
 	}
 
 	async fn inline_ratelimit_resource_limits(
-		&self,
-		txn: &Transaction,
+		&mut self,
+		txn: Arc<Transaction>,
 		plan: &TopLevelExpr,
 	) -> FlowResult<Option<ResourceLimits>> {
 		let Some((action, targets)) = Self::table_ratelimit_targets(plan) else {
@@ -104,11 +104,46 @@ impl Executor {
 			let Expr::Table(table) = target else {
 				continue;
 			};
+			let table_name = table.to_string();
 			let table = txn.expect_tb_by_name(self.opt.ns()?, self.opt.db()?, table).await?;
-			for policy in table.ratelimits.iter() {
-				if !policy.actions.contains(&action) || policy.condition.is_some() {
+			for (policy_index, policy) in table.ratelimits.iter().enumerate() {
+				if !policy.actions.contains(&action) {
 					continue;
 				}
+
+				let opt_no_perms = self.opt.new_with_perms(false);
+				if let Some(condition) = &policy.condition {
+					let applies = self
+						.stack
+						.enter(|stk| condition.compute(stk, &self.ctx, &opt_no_perms, None))
+						.finish()
+						.await?
+						.is_truthy();
+					if !applies {
+						continue;
+					}
+				}
+
+				let bucket = self
+					.stack
+					.enter(|stk| policy.bucket.compute(stk, &self.ctx, &opt_no_perms, None))
+					.finish()
+					.await?;
+				let key = format!(
+					"{}:{}:{}:{:?}:{}:{}",
+					self.opt.ns()?,
+					self.opt.db()?,
+					table_name,
+					action,
+					policy_index,
+					bucket.to_sql(),
+				);
+				if !self.ctx.rate_limiter().admit(key, policy.limit, policy.period, policy.burst) {
+					return Err(ControlFlow::Err(anyhow::Error::new(Error::RateLimitExceeded {
+						scope: format!("table {table_name}"),
+					})));
+				}
+
 				if let Some(limit) = policy.scan {
 					Self::merge_limit(&mut scan, limit);
 				}
@@ -134,9 +169,16 @@ impl Executor {
 
 	async fn install_inline_ratelimit_budget(
 		&mut self,
-		txn: &Transaction,
+		txn: Arc<Transaction>,
 		plan: &TopLevelExpr,
 	) -> FlowResult<()> {
+		let ctx = Arc::get_mut(&mut self.ctx).ok_or_else(|| {
+			anyhow::Error::new(Error::unreachable(
+				"Tried to update a Context resource budget with multiple references",
+			))
+		})?;
+		ctx.set_transaction(Arc::clone(&txn));
+
 		let budget = self
 			.inline_ratelimit_resource_limits(txn, plan)
 			.await?
@@ -763,7 +805,7 @@ impl Executor {
 		start: &Instant,
 		plan: TopLevelExpr,
 	) -> FlowResult<Value> {
-		self.install_inline_ratelimit_budget(&txn, &plan).await?;
+		self.install_inline_ratelimit_budget(Arc::clone(&txn), &plan).await?;
 
 		/// Helper method to get mutable access to the context
 		macro_rules! ctx_mut {
@@ -2192,6 +2234,97 @@ mod tests {
 	use crate::dbs::Session;
 	use crate::iam::{Level, Role};
 	use crate::kvs::Datastore;
+
+	#[tokio::test]
+	async fn inline_table_ratelimit_admission_rejects_second_request_in_window() {
+		let ds = Datastore::new("memory").await.unwrap();
+		let sess = Session::owner().with_ns("NS").with_db("DB");
+
+		ds.execute(
+			"DEFINE NAMESPACE NS; USE NS NS; DEFINE DATABASE DB; \
+			 DEFINE TABLE person RATELIMIT FOR SELECT BY $session.id LIMIT 1 PER 1h; \
+			 CREATE person:1;",
+			&sess,
+			None,
+		)
+		.await
+		.unwrap();
+
+		ds.execute("SELECT * FROM person", &sess, None).await.unwrap()[0].result.as_ref().unwrap();
+		let res = ds.execute("SELECT * FROM person", &sess, None).await.unwrap();
+		let err = res[0].result.as_ref().unwrap_err().to_string();
+		assert!(err.contains("rate limit"), "expected rate limit error, got: {err}");
+	}
+
+	#[tokio::test]
+	async fn inline_table_ratelimit_burst_allows_initial_capacity() {
+		let ds = Datastore::new("memory").await.unwrap();
+		let sess = Session::owner().with_ns("NS").with_db("DB");
+
+		ds.execute(
+			"DEFINE NAMESPACE NS; USE NS NS; DEFINE DATABASE DB; \
+			 DEFINE TABLE person RATELIMIT FOR SELECT BY $session.id LIMIT 1 PER 1h BURST 2; \
+			 CREATE person:1;",
+			&sess,
+			None,
+		)
+		.await
+		.unwrap();
+
+		ds.execute("SELECT * FROM person", &sess, None).await.unwrap()[0].result.as_ref().unwrap();
+		ds.execute("SELECT * FROM person", &sess, None).await.unwrap()[0].result.as_ref().unwrap();
+		let res = ds.execute("SELECT * FROM person", &sess, None).await.unwrap();
+		assert!(res[0].result.as_ref().unwrap_err().to_string().contains("rate limit"));
+	}
+
+	#[tokio::test]
+	async fn inline_table_ratelimit_by_expression_isolates_buckets() {
+		let ds = Datastore::new("memory").await.unwrap();
+		let mut sess_a = Session::owner().with_ns("NS").with_db("DB");
+		sess_a.ip = Some("10.0.0.1".to_string());
+		let mut sess_b = Session::owner().with_ns("NS").with_db("DB");
+		sess_b.ip = Some("10.0.0.2".to_string());
+
+		ds.execute(
+			"DEFINE NAMESPACE NS; USE NS NS; DEFINE DATABASE DB; \
+			 DEFINE TABLE person RATELIMIT FOR SELECT BY $session.ip LIMIT 1 PER 1h; \
+			 CREATE person:1;",
+			&sess_a,
+			None,
+		)
+		.await
+		.unwrap();
+
+		ds.execute("SELECT * FROM person", &sess_a, None).await.unwrap()[0]
+			.result
+			.as_ref()
+			.unwrap();
+		ds.execute("SELECT * FROM person", &sess_b, None).await.unwrap()[0]
+			.result
+			.as_ref()
+			.unwrap();
+		let res = ds.execute("SELECT * FROM person", &sess_a, None).await.unwrap();
+		assert!(res[0].result.as_ref().unwrap_err().to_string().contains("rate limit"));
+	}
+
+	#[tokio::test]
+	async fn inline_table_ratelimit_where_false_does_not_apply() {
+		let ds = Datastore::new("memory").await.unwrap();
+		let sess = Session::owner().with_ns("NS").with_db("DB");
+
+		ds.execute(
+			"DEFINE NAMESPACE NS; USE NS NS; DEFINE DATABASE DB; \
+			 DEFINE TABLE person RATELIMIT FOR SELECT WHERE false BY $session.id LIMIT 1 PER 1h; \
+			 CREATE person:1;",
+			&sess,
+			None,
+		)
+		.await
+		.unwrap();
+
+		ds.execute("SELECT * FROM person", &sess, None).await.unwrap()[0].result.as_ref().unwrap();
+		ds.execute("SELECT * FROM person", &sess, None).await.unwrap()[0].result.as_ref().unwrap();
+	}
 
 	#[tokio::test]
 	async fn inline_table_ratelimit_result_budget_errors_when_exceeded() {

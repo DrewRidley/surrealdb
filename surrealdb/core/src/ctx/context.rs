@@ -42,7 +42,7 @@ use crate::dbs::{
 use crate::err::Error;
 use crate::exec::function::FunctionRegistry;
 use crate::expr::Base;
-use crate::gov::ResourceBudget;
+use crate::gov::{RateLimiter, ResourceBudget};
 #[cfg(feature = "http")]
 use crate::http::HttpClient;
 use crate::iam::{Action, ResourceKind};
@@ -137,6 +137,8 @@ pub struct Context {
 	matches_context: Option<Arc<crate::exec::function::MatchesContext>>,
 	// Shared resource budget and usage counters for this query/request.
 	resource_budget: Option<Arc<ResourceBudget>>,
+	// Shared admission limiter for schema-defined rate limits.
+	rate_limiter: Arc<RateLimiter>,
 	// KNN context for index functions (vector::distance::knn)
 	knn_context: Option<Arc<crate::exec::function::KnnContext>>,
 	/// Client for making http requests.
@@ -201,6 +203,7 @@ impl Context {
 			statement_counters: None,
 			matches_context: None,
 			resource_budget: None,
+			rate_limiter: Arc::new(RateLimiter::default()),
 			knn_context: None,
 			config: Arc::clone(&parent.config),
 			#[cfg(feature = "http")]
@@ -260,6 +263,7 @@ impl Context {
 			statement_counters: parent.statement_counters.clone(),
 			matches_context: parent.matches_context.clone(),
 			resource_budget: parent.resource_budget.clone(),
+			rate_limiter: Arc::clone(&parent.rate_limiter),
 			knn_context: parent.knn_context.clone(),
 			config: Arc::clone(&parent.config),
 			#[cfg(feature = "http")]
@@ -305,6 +309,7 @@ impl Context {
 			statement_counters: parent.statement_counters.clone(),
 			matches_context: parent.matches_context.clone(),
 			resource_budget: parent.resource_budget.clone(),
+			rate_limiter: Arc::clone(&parent.rate_limiter),
 			knn_context: parent.knn_context.clone(),
 			config: Arc::clone(&parent.config),
 			#[cfg(feature = "http")]
@@ -367,6 +372,7 @@ impl Context {
 			statement_counters: from.statement_counters.clone(),
 			matches_context: from.matches_context.clone(),
 			resource_budget: from.resource_budget.clone(),
+			rate_limiter: Arc::clone(&from.rate_limiter),
 			knn_context: from.knn_context.clone(),
 			config: Arc::clone(&from.config),
 			#[cfg(feature = "http")]
@@ -420,6 +426,7 @@ impl Context {
 			statement_counters: from.statement_counters.clone(),
 			matches_context: from.matches_context.clone(),
 			resource_budget: from.resource_budget.clone(),
+			rate_limiter: Arc::clone(&from.rate_limiter),
 			knn_context: from.knn_context.clone(),
 			config: Arc::clone(&from.config),
 			#[cfg(feature = "http")]
@@ -447,6 +454,7 @@ impl Context {
 		sequences: Sequences,
 		cache: Arc<DatastoreCache>,
 		function_registry: Arc<FunctionRegistry>,
+		rate_limiter: Arc<RateLimiter>,
 		#[cfg(feature = "http")] http_client: Arc<HttpClient>,
 		#[cfg(storage)] temporary_directory: Option<Arc<PathBuf>>,
 		buckets: BucketsManager,
@@ -482,6 +490,7 @@ impl Context {
 			statement_counters: None,
 			matches_context: None,
 			resource_budget: None,
+			rate_limiter,
 			knn_context: None,
 			config,
 			#[cfg(feature = "http")]
@@ -530,6 +539,7 @@ impl Context {
 			statement_counters: None,
 			matches_context: None,
 			resource_budget: None,
+			rate_limiter: Arc::new(RateLimiter::default()),
 			knn_context: None,
 			config: Default::default(),
 			#[cfg(feature = "http")]
@@ -553,6 +563,11 @@ impl Context {
 	/// Returns the shared resource budget for this context, if one is installed.
 	pub(crate) fn resource_budget(&self) -> Option<&Arc<ResourceBudget>> {
 		self.resource_budget.as_ref()
+	}
+
+	/// Returns the shared admission limiter for schema-defined rate limits.
+	pub(crate) fn rate_limiter(&self) -> &Arc<RateLimiter> {
+		&self.rate_limiter
 	}
 
 	/// Installs a shared resource budget on this context.

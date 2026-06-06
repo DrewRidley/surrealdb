@@ -236,6 +236,8 @@ pub struct Datastore {
 	/// `Arc`. Every `Context` clones this `Arc` rather than rebuilding the
 	/// registry, which is otherwise the single biggest per-query cost.
 	function_registry: Arc<FunctionRegistry>,
+	// Shared admission limiter for schema-defined rate limits.
+	rate_limiter: Arc<crate::gov::RateLimiter>,
 	// The index asynchronous builder
 	index_builder: IndexBuilder,
 	#[cfg(storage)]
@@ -980,6 +982,7 @@ impl Datastore {
 			temporary_directory: self.temporary_directory,
 			cache: Arc::new(DatastoreCache::new(self.config.datastore_cache_size)),
 			function_registry: Arc::new(FunctionRegistry::with_builtins()),
+			rate_limiter: Arc::new(crate::gov::RateLimiter::default()),
 			buckets: self.buckets,
 			sequences: Sequences::new(self.transaction_factory.clone(), self.id),
 			transaction_factory: self.transaction_factory,
@@ -1025,6 +1028,7 @@ impl Datastore {
 			temporary_directory: self.temporary_directory.clone(),
 			cache: Arc::new(DatastoreCache::new(self.config.datastore_cache_size)),
 			function_registry: Arc::new(FunctionRegistry::with_builtins()),
+			rate_limiter: Arc::new(crate::gov::RateLimiter::default()),
 			buckets: self.buckets.clone(),
 			sequences: Sequences::new(transaction_factory.clone(), id),
 			transaction_factory,
@@ -3544,6 +3548,7 @@ impl Datastore {
 			self.sequences.clone(),
 			Arc::clone(&self.cache),
 			Arc::clone(&self.function_registry),
+			Arc::clone(&self.rate_limiter),
 			#[cfg(feature = "http")]
 			Arc::clone(&self.http_client),
 			#[cfg(storage)]

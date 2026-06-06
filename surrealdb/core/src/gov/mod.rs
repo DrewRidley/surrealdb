@@ -5,7 +5,9 @@
 //! Surrealism host calls without changing query behaviour while disabled.
 
 mod budget;
+mod ratelimit;
 mod usage;
 
 pub use budget::{ChargeOutcome, EnforcementMode, ResourceBudget, ResourceLimits};
+pub(crate) use ratelimit::RateLimiter;
 pub use usage::{ResourceKind, ResourceUsageSnapshot};
