@@ -2236,6 +2236,111 @@ mod tests {
 	use crate::kvs::Datastore;
 
 	#[tokio::test]
+	async fn inline_field_ratelimit_create_rejects_second_request_in_window() {
+		let ds = Datastore::new("memory").await.unwrap();
+		let sess = Session::owner().with_ns("NS").with_db("DB");
+
+		ds.execute(
+			"DEFINE NAMESPACE NS; USE NS NS; DEFINE DATABASE DB; \
+			 DEFINE TABLE person SCHEMAFULL; \
+			 DEFINE FIELD name ON person TYPE string RATELIMIT FOR CREATE BY $session.id LIMIT 1 PER 1h;",
+			&sess,
+			None,
+		)
+		.await
+		.unwrap();
+
+		ds.execute("CREATE person:1 SET name = 'one'", &sess, None).await.unwrap()[0]
+			.result
+			.as_ref()
+			.unwrap();
+		let res = ds.execute("CREATE person:2 SET name = 'two'", &sess, None).await.unwrap();
+		let err = res[0].result.as_ref().unwrap_err().to_string();
+		assert!(err.contains("rate limit"), "expected rate limit error, got: {err}");
+	}
+
+	#[tokio::test]
+	async fn inline_field_ratelimit_update_uses_field_bucket() {
+		let ds = Datastore::new("memory").await.unwrap();
+		let sess = Session::owner().with_ns("NS").with_db("DB");
+
+		ds.execute(
+			"DEFINE NAMESPACE NS; USE NS NS; DEFINE DATABASE DB; \
+			 DEFINE TABLE person SCHEMAFULL; \
+			 DEFINE FIELD name ON person TYPE string RATELIMIT FOR UPDATE BY $session.id LIMIT 1 PER 1h; \
+			 CREATE person:1 SET name = 'one';",
+			&sess,
+			None,
+		)
+		.await
+		.unwrap();
+
+		ds.execute("UPDATE person:1 SET name = 'two'", &sess, None).await.unwrap()[0]
+			.result
+			.as_ref()
+			.unwrap();
+		let res = ds.execute("UPDATE person:1 SET name = 'three'", &sess, None).await.unwrap();
+		let err = res[0].result.as_ref().unwrap_err().to_string();
+		assert!(err.contains("rate limit"), "expected rate limit error, got: {err}");
+	}
+
+	#[tokio::test]
+	async fn inline_field_ratelimit_by_expression_isolates_buckets() {
+		let ds = Datastore::new("memory").await.unwrap();
+		let mut sess_a = Session::owner().with_ns("NS").with_db("DB");
+		sess_a.ip = Some("127.0.0.1".to_string());
+		let mut sess_b = Session::owner().with_ns("NS").with_db("DB");
+		sess_b.ip = Some("127.0.0.2".to_string());
+
+		ds.execute(
+			"DEFINE NAMESPACE NS; USE NS NS; DEFINE DATABASE DB; \
+			 DEFINE TABLE person SCHEMAFULL; \
+			 DEFINE FIELD name ON person TYPE string RATELIMIT FOR CREATE BY $session.ip LIMIT 1 PER 1h;",
+			&sess_a,
+			None,
+		)
+		.await
+		.unwrap();
+
+		ds.execute("CREATE person:1 SET name = 'one'", &sess_a, None).await.unwrap()[0]
+			.result
+			.as_ref()
+			.unwrap();
+		ds.execute("CREATE person:2 SET name = 'two'", &sess_b, None).await.unwrap()[0]
+			.result
+			.as_ref()
+			.unwrap();
+		let res = ds.execute("CREATE person:3 SET name = 'three'", &sess_a, None).await.unwrap();
+		let err = res[0].result.as_ref().unwrap_err().to_string();
+		assert!(err.contains("rate limit"), "expected rate limit error, got: {err}");
+	}
+
+	#[tokio::test]
+	async fn inline_field_ratelimit_where_false_does_not_apply() {
+		let ds = Datastore::new("memory").await.unwrap();
+		let sess = Session::owner().with_ns("NS").with_db("DB");
+
+		ds.execute(
+			"DEFINE NAMESPACE NS; USE NS NS; DEFINE DATABASE DB; \
+			 DEFINE TABLE person SCHEMAFULL; \
+			 DEFINE FIELD name ON person TYPE string RATELIMIT FOR CREATE WHERE false BY $session.id LIMIT 1 PER 1h;",
+			&sess,
+			None,
+		)
+		.await
+		.unwrap();
+
+		ds.execute("CREATE person:1 SET name = 'one'", &sess, None).await.unwrap()[0]
+			.result
+			.as_ref()
+			.unwrap();
+		ds.execute("CREATE person:2 SET name = 'two'", &sess, None).await.unwrap()[0]
+			.result
+			.as_ref()
+			.unwrap();
+	}
+
+	#[tokio::test]
 	async fn inline_table_ratelimit_admission_rejects_second_request_in_window() {
 		let ds = Datastore::new("memory").await.unwrap();
 		let sess = Session::owner().with_ns("NS").with_db("DB");

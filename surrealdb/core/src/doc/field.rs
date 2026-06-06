@@ -342,6 +342,8 @@ impl Document {
 						val = field.process_assert_clause(val).await?;
 					}
 				}
+				// Process any RATELIMIT clause
+				field.process_ratelimit_clause(&val).await?;
 				// Process any PERMISSIONS clause
 				val = field.process_permissions_clause(val).await?;
 				// Skip this field?
@@ -501,6 +503,81 @@ enum RefAction<'a> {
 }
 
 impl FieldEditContext<'_> {
+	/// Process any RATELIMIT clause for the field definition.
+	async fn process_ratelimit_clause(&mut self, val: &Value) -> Result<()> {
+		if self.def.ratelimits.is_empty() || val == self.old.as_ref() {
+			return Ok(());
+		}
+
+		let action = if self.doc.is_new() {
+			catalog::PermissionKind::Create
+		} else {
+			catalog::PermissionKind::Update
+		};
+		let doc = Some(&self.doc.current);
+		let now = Arc::new(val.clone());
+		for (policy_index, policy) in self.def.ratelimits.iter().enumerate() {
+			if !policy.actions.contains(&action) {
+				continue;
+			}
+
+			let opt = &self.opt.new_with_perms(false);
+			let ctx = match self.context.take() {
+				Some(mut ctx) => {
+					ctx.add_value("after", Arc::clone(&now));
+					ctx.add_value("value", Arc::clone(&now));
+					ctx
+				}
+				None => {
+					let mut ctx = Context::new_child(self.ctx);
+					ctx.add_value("before", Arc::clone(&self.old));
+					ctx.add_value("input", Arc::clone(&self.user_input));
+					ctx.add_value("after", Arc::clone(&now));
+					ctx.add_value("value", Arc::clone(&now));
+					ctx
+				}
+			};
+			let ctx = ctx.freeze();
+
+			if let Some(condition) = &policy.condition {
+				let applies = self
+					.stk
+					.run(|stk| condition.compute(stk, &ctx, opt, doc))
+					.await
+					.catch_return()?
+					.is_truthy();
+				if !applies {
+					self.context = Some(Context::unfreeze(ctx)?);
+					continue;
+				}
+			}
+
+			let bucket = self
+				.stk
+				.run(|stk| policy.bucket.compute(stk, &ctx, opt, doc))
+				.await
+				.catch_return()?;
+			let key = format!(
+				"{}:{}:{}:{}:{:?}:{}:{}",
+				self.opt.ns()?,
+				self.opt.db()?,
+				self.rid.table,
+				self.def.name.to_sql(),
+				action,
+				policy_index,
+				bucket.to_sql(),
+			);
+			self.context = Some(Context::unfreeze(ctx)?);
+			if !self.ctx.rate_limiter().admit(key, policy.limit, policy.period, policy.burst) {
+				bail!(Error::RateLimitExceeded {
+					scope: format!("field {}", self.def.name.to_sql()),
+				});
+			}
+		}
+
+		Ok(())
+	}
+
 	/// Process any TYPE clause for the field definition
 	async fn process_type_clause(&self, val: Value) -> Result<Value> {
 		// Check for a TYPE clause
