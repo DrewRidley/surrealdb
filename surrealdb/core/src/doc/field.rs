@@ -568,7 +568,12 @@ impl FieldEditContext<'_> {
 				bucket.to_sql(),
 			);
 			self.context = Some(Context::unfreeze(ctx)?);
-			if !self.ctx.rate_limiter().admit(key, policy.limit, policy.period, policy.burst) {
+			if !self
+				.ctx
+				.rate_limiter()
+				.admit_kv(&self.ctx.tx(), key, policy.limit, policy.period, policy.burst)
+				.await?
+			{
 				bail!(Error::RateLimitExceeded {
 					scope: format!("field {}", self.def.name.to_sql()),
 				});

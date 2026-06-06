@@ -138,7 +138,12 @@ impl Executor {
 					policy_index,
 					bucket.to_sql(),
 				);
-				if !self.ctx.rate_limiter().admit(key, policy.limit, policy.period, policy.burst) {
+				if !self
+					.ctx
+					.rate_limiter()
+					.admit_kv(&txn, key, policy.limit, policy.period, policy.burst)
+					.await?
+				{
 					return Err(ControlFlow::Err(anyhow::Error::new(Error::RateLimitExceeded {
 						scope: format!("table {table_name}"),
 					})));
@@ -1181,7 +1186,12 @@ impl Executor {
 		start: &Instant,
 		plan: TopLevelExpr,
 	) -> Result<Value> {
-		let transaction_type = if plan.read_only() {
+		// SELECT can be guarded by inline RATELIMIT policies. Distributed admission uses the
+		// KV store to update bucket state atomically, so SELECT statements need a writable
+		// statement transaction even when the query body itself is read-only.
+		let transaction_type = if matches!(plan, TopLevelExpr::Expr(Expr::Select(_))) {
+			TransactionType::Write
+		} else if plan.read_only() {
 			TransactionType::Read
 		} else {
 			TransactionType::Write
