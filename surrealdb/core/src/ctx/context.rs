@@ -560,6 +560,11 @@ impl Context {
 		self.resource_budget = Some(budget);
 	}
 
+	/// Replaces the shared resource budget on this context.
+	pub(crate) fn set_resource_budget_opt(&mut self, budget: Option<Arc<ResourceBudget>>) {
+		self.resource_budget = budget;
+	}
+
 	/// Freezes this context, allowing it to be used as a parent context.
 	pub(crate) fn freeze(self) -> FrozenContext {
 		Arc::new(self)

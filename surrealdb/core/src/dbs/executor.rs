@@ -15,7 +15,7 @@ use wasm_bindgen_futures::spawn_local as spawn;
 use web_time::Instant;
 
 use crate::catalog::providers::{
-	CatalogProvider, DatabaseProvider, NamespaceProvider, RootProvider,
+	CatalogProvider, DatabaseProvider, NamespaceProvider, RootProvider, TableProvider,
 };
 use crate::ctx::reason::Reason;
 use crate::ctx::{Context, FrozenContext};
@@ -31,7 +31,7 @@ use crate::expr::paths::{DB, NS};
 use crate::expr::plan::LogicalPlan;
 use crate::expr::statements::{OptionStatement, UseStatement};
 use crate::expr::{Base, ControlFlow, Expr, FlowResult, TopLevelExpr};
-use crate::gov::{ResourceBudget, ResourceKind as GovResourceKind};
+use crate::gov::{ResourceBudget, ResourceKind as GovResourceKind, ResourceLimits};
 use crate::iam::{Action, ResourceKind};
 use crate::kvs::slowlog::SlowLogVisit;
 use crate::kvs::{Datastore, LockType, Transaction, TransactionType};
@@ -41,7 +41,7 @@ use crate::observe::{
 };
 use crate::rpc::types_error_from_anyhow;
 use crate::val::{Array, Value, convert_value_to_public_value};
-use crate::{err, expr, sql};
+use crate::{catalog, err, expr, sql};
 
 const TARGET: &str = "surrealdb::core::dbs";
 
@@ -66,6 +66,98 @@ pub struct Executor {
 }
 
 impl Executor {
+	fn table_ratelimit_targets(plan: &TopLevelExpr) -> Option<(catalog::PermissionKind, &[Expr])> {
+		match plan {
+			TopLevelExpr::Expr(Expr::Select(stmt)) => {
+				Some((catalog::PermissionKind::Select, &stmt.what))
+			}
+			TopLevelExpr::Expr(Expr::Create(stmt)) => {
+				Some((catalog::PermissionKind::Create, &stmt.what))
+			}
+			TopLevelExpr::Expr(Expr::Update(stmt)) => {
+				Some((catalog::PermissionKind::Update, &stmt.what))
+			}
+			TopLevelExpr::Expr(Expr::Delete(stmt)) => {
+				Some((catalog::PermissionKind::Delete, &stmt.what))
+			}
+			_ => None,
+		}
+	}
+
+	fn merge_limit(slot: &mut Option<u64>, candidate: u64) {
+		*slot = Some(slot.map(|current| current.min(candidate)).unwrap_or(candidate));
+	}
+
+	async fn inline_ratelimit_resource_limits(
+		&self,
+		txn: &Transaction,
+		plan: &TopLevelExpr,
+	) -> FlowResult<Option<ResourceLimits>> {
+		let Some((action, targets)) = Self::table_ratelimit_targets(plan) else {
+			return Ok(None);
+		};
+
+		let mut scan = None;
+		let mut result = None;
+
+		for target in targets {
+			let Expr::Table(table) = target else {
+				continue;
+			};
+			let table = txn.expect_tb_by_name(self.opt.ns()?, self.opt.db()?, table).await?;
+			for policy in table.ratelimits.iter() {
+				if !policy.actions.contains(&action) || policy.condition.is_some() {
+					continue;
+				}
+				if let Some(limit) = policy.scan {
+					Self::merge_limit(&mut scan, limit);
+				}
+				if let Some(limit) = policy.result {
+					Self::merge_limit(&mut result, limit);
+				}
+			}
+		}
+
+		let mut limits = ResourceLimits::default();
+		let mut any = false;
+		if let Some(scan) = scan {
+			limits = limits.with_limit(GovResourceKind::ScanKey, scan);
+			any = true;
+		}
+		if let Some(result) = result {
+			limits = limits.with_limit(GovResourceKind::ResultRow, result);
+			any = true;
+		}
+
+		Ok(any.then_some(limits))
+	}
+
+	async fn install_inline_ratelimit_budget(
+		&mut self,
+		txn: &Transaction,
+		plan: &TopLevelExpr,
+	) -> FlowResult<()> {
+		let budget = self
+			.inline_ratelimit_resource_limits(txn, plan)
+			.await?
+			.map(ResourceBudget::enforcing)
+			.map(Arc::new);
+		if let Some(budget) = budget.as_ref() {
+			budget.set_truncation_allowed(matches!(
+				plan,
+				TopLevelExpr::Use(_) | TopLevelExpr::Show(_) | TopLevelExpr::Expr(Expr::Select(_))
+			));
+		}
+
+		let ctx = Arc::get_mut(&mut self.ctx).ok_or_else(|| {
+			anyhow::Error::new(Error::unreachable(
+				"Tried to update a Context resource budget with multiple references",
+			))
+		})?;
+		ctx.set_resource_budget_opt(budget);
+		Ok(())
+	}
+
 	fn partial_reason_for_result(&self, is_error: bool) -> Option<PartialReason> {
 		let truncated = self.ctx.resource_budget().and_then(|budget| budget.take_truncated_kind());
 		if is_error {
@@ -671,6 +763,8 @@ impl Executor {
 		start: &Instant,
 		plan: TopLevelExpr,
 	) -> FlowResult<Value> {
+		self.install_inline_ratelimit_budget(&txn, &plan).await?;
+
 		/// Helper method to get mutable access to the context
 		macro_rules! ctx_mut {
 			() => {
@@ -2098,6 +2192,26 @@ mod tests {
 	use crate::dbs::Session;
 	use crate::iam::{Level, Role};
 	use crate::kvs::Datastore;
+
+	#[tokio::test]
+	async fn inline_table_ratelimit_result_budget_errors_when_exceeded() {
+		let ds = Datastore::new("memory").await.unwrap();
+		let sess = Session::owner().with_ns("NS").with_db("DB");
+
+		ds.execute(
+			"DEFINE NAMESPACE NS; USE NS NS; DEFINE DATABASE DB; \
+			 DEFINE TABLE person RATELIMIT FOR SELECT BY $session.id LIMIT 100 PER 1s SCAN 100 RESULT 1; \
+			 CREATE person:1; CREATE person:2;",
+			&sess,
+			None,
+		)
+		.await
+		.unwrap();
+
+		let res = ds.execute("SELECT * FROM person", &sess, None).await.unwrap();
+		let err = res[0].result.as_ref().unwrap_err().to_string();
+		assert!(err.contains("result rows"), "expected result row budget error, got: {err}");
+	}
 
 	#[tokio::test]
 	async fn check_execute_option_permissions() {
