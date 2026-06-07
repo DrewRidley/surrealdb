@@ -34,11 +34,12 @@ pub(crate) fn charge_scanned_batch(
 	};
 	let rows = row_count as u64;
 	let outcome = budget.charge_or_truncate(GovResourceKind::ScanKey, rows)?;
-	if matches!(outcome, ChargeOutcome::Truncated(_)) {
-		return Ok(outcome);
-	}
-	budget.charge(GovResourceKind::RowRead, rows)?;
-	Ok(ChargeOutcome::Charged)
+	let row_reads = match outcome {
+		ChargeOutcome::Charged => rows,
+		ChargeOutcome::Truncated(_, allowed) => allowed,
+	};
+	budget.charge(GovResourceKind::RowRead, row_reads)?;
+	Ok(outcome)
 }
 
 /// Convert a [`Value`] to a [`RecordIdKey`] for use in key range construction.
@@ -326,8 +327,11 @@ mod tests {
 
 		assert_eq!(
 			charge_scanned_batch(Some(&budget), 3).unwrap(),
-			ChargeOutcome::Truncated(ResourceKind::ScanKey)
+			ChargeOutcome::Truncated(ResourceKind::ScanKey, 2)
 		);
 		assert_eq!(budget.truncated_kind(), Some(ResourceKind::ScanKey));
+		let usage = budget.usage();
+		assert_eq!(usage.get(ResourceKind::ScanKey), 3);
+		assert_eq!(usage.get(ResourceKind::RowRead), 2);
 	}
 }

@@ -125,28 +125,30 @@ impl KVStore for ChargingKvStore {
 	}
 
 	async fn del_rng(&self, start: Bound<String>, end: Bound<String>) -> Result<()> {
-		self.charge(ResourceKind::ModuleHostKvWrite, 1)?;
+		let count = self.inner.count(start.clone(), end.clone()).await?;
+		self.charge(ResourceKind::ModuleHostKvWrite, count.max(1))?;
 		self.inner.del_rng(start, end).await
 	}
 
 	async fn get_batch(&self, keys: Vec<String>) -> Result<Vec<Option<surrealdb_types::Value>>> {
-		self.charge(ResourceKind::ModuleHostKvRead, keys.len() as u64)?;
+		self.charge(ResourceKind::ModuleHostKvRead, (keys.len() as u64).max(1))?;
 		self.inner.get_batch(keys).await
 	}
 
 	async fn set_batch(&self, entries: Vec<(String, surrealdb_types::Value)>) -> Result<()> {
-		self.charge(ResourceKind::ModuleHostKvWrite, entries.len() as u64)?;
+		self.charge(ResourceKind::ModuleHostKvWrite, (entries.len() as u64).max(1))?;
 		self.inner.set_batch(entries).await
 	}
 
 	async fn del_batch(&self, keys: Vec<String>) -> Result<()> {
-		self.charge(ResourceKind::ModuleHostKvWrite, keys.len() as u64)?;
+		self.charge(ResourceKind::ModuleHostKvWrite, (keys.len() as u64).max(1))?;
 		self.inner.del_batch(keys).await
 	}
 
 	async fn keys(&self, start: Bound<String>, end: Bound<String>) -> Result<Vec<String>> {
-		self.charge(ResourceKind::ModuleHostKvRead, 1)?;
-		self.inner.keys(start, end).await
+		let keys = self.inner.keys(start, end).await?;
+		self.charge(ResourceKind::ModuleHostKvRead, (keys.len() as u64).max(1))?;
+		Ok(keys)
 	}
 
 	async fn values(
@@ -154,8 +156,9 @@ impl KVStore for ChargingKvStore {
 		start: Bound<String>,
 		end: Bound<String>,
 	) -> Result<Vec<surrealdb_types::Value>> {
-		self.charge(ResourceKind::ModuleHostKvRead, 1)?;
-		self.inner.values(start, end).await
+		let values = self.inner.values(start, end).await?;
+		self.charge(ResourceKind::ModuleHostKvRead, (values.len() as u64).max(1))?;
+		Ok(values)
 	}
 
 	async fn entries(
@@ -163,13 +166,15 @@ impl KVStore for ChargingKvStore {
 		start: Bound<String>,
 		end: Bound<String>,
 	) -> Result<Vec<(String, surrealdb_types::Value)>> {
-		self.charge(ResourceKind::ModuleHostKvRead, 1)?;
-		self.inner.entries(start, end).await
+		let entries = self.inner.entries(start, end).await?;
+		self.charge(ResourceKind::ModuleHostKvRead, (entries.len() as u64).max(1))?;
+		Ok(entries)
 	}
 
 	async fn count(&self, start: Bound<String>, end: Bound<String>) -> Result<u64> {
-		self.charge(ResourceKind::ModuleHostKvRead, 1)?;
-		self.inner.count(start, end).await
+		let count = self.inner.count(start, end).await?;
+		self.charge(ResourceKind::ModuleHostKvRead, count.max(1))?;
+		Ok(count)
 	}
 }
 

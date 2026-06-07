@@ -30,7 +30,7 @@ use crate::expr::parameterize::expr_to_ident;
 use crate::expr::paths::{DB, NS};
 use crate::expr::plan::LogicalPlan;
 use crate::expr::statements::{OptionStatement, UseStatement};
-use crate::expr::{Base, ControlFlow, Expr, FlowResult, TopLevelExpr};
+use crate::expr::{Base, ControlFlow, Expr, FlowResult, Literal, TopLevelExpr};
 use crate::gov::{ResourceBudget, ResourceKind as GovResourceKind, ResourceLimits};
 use crate::iam::{Action, ResourceKind};
 use crate::kvs::slowlog::SlowLogVisit;
@@ -40,7 +40,7 @@ use crate::observe::{
 	StatementEventSafe, StatementType,
 };
 use crate::rpc::types_error_from_anyhow;
-use crate::val::{Array, Value, convert_value_to_public_value};
+use crate::val::{Array, TableName, Value, convert_value_to_public_value};
 use crate::{catalog, err, expr, sql};
 
 const TARGET: &str = "surrealdb::core::dbs";
@@ -77,21 +77,51 @@ pub struct Executor {
 }
 
 impl Executor {
-	fn table_ratelimit_targets(plan: &TopLevelExpr) -> Option<(catalog::PermissionKind, &[Expr])> {
-		match plan {
+	fn table_ratelimit_target_names(
+		plan: &TopLevelExpr,
+	) -> Option<(catalog::PermissionKind, Vec<TableName>)> {
+		fn target_name(expr: &Expr) -> Option<TableName> {
+			match expr {
+				Expr::Table(table) => Some(table.clone()),
+				Expr::Literal(Literal::RecordId(record)) => Some(record.table.clone()),
+				Expr::Literal(Literal::String(table)) => Some(TableName::new(table.as_str())),
+				_ => None,
+			}
+		}
+
+		let (action, targets): (catalog::PermissionKind, Vec<&Expr>) = match plan {
 			TopLevelExpr::Expr(Expr::Select(stmt)) => {
-				Some((catalog::PermissionKind::Select, &stmt.what))
+				(catalog::PermissionKind::Select, stmt.what.iter().collect())
 			}
 			TopLevelExpr::Expr(Expr::Create(stmt)) => {
-				Some((catalog::PermissionKind::Create, &stmt.what))
+				(catalog::PermissionKind::Create, stmt.what.iter().collect())
 			}
 			TopLevelExpr::Expr(Expr::Update(stmt)) => {
-				Some((catalog::PermissionKind::Update, &stmt.what))
+				(catalog::PermissionKind::Update, stmt.what.iter().collect())
+			}
+			TopLevelExpr::Expr(Expr::Upsert(stmt)) => {
+				(catalog::PermissionKind::Update, stmt.what.iter().collect())
 			}
 			TopLevelExpr::Expr(Expr::Delete(stmt)) => {
-				Some((catalog::PermissionKind::Delete, &stmt.what))
+				(catalog::PermissionKind::Delete, stmt.what.iter().collect())
 			}
-			_ => None,
+			TopLevelExpr::Expr(Expr::Insert(stmt)) => {
+				let Some(into) = &stmt.into else {
+					return None;
+				};
+				(catalog::PermissionKind::Create, vec![into])
+			}
+			TopLevelExpr::Expr(Expr::Relate(stmt)) => {
+				(catalog::PermissionKind::Create, vec![&stmt.through])
+			}
+			_ => return None,
+		};
+
+		let targets = targets.into_iter().filter_map(target_name).collect::<Vec<_>>();
+		if targets.is_empty() {
+			None
+		} else {
+			Some((action, targets))
 		}
 	}
 
@@ -104,19 +134,17 @@ impl Executor {
 		txn: Arc<Transaction>,
 		plan: &TopLevelExpr,
 	) -> FlowResult<Option<ResourceLimits>> {
-		let Some((action, targets)) = Self::table_ratelimit_targets(plan) else {
+		let Some((action, targets)) = Self::table_ratelimit_target_names(plan) else {
 			return Ok(None);
 		};
 
 		let mut scan = None;
 		let mut result = None;
 
-		for target in targets {
-			let Expr::Table(table) = target else {
-				continue;
-			};
-			let table_name = table.to_string();
-			let table = txn.expect_tb_by_name(self.opt.ns()?, self.opt.db()?, table).await?;
+		for table_target in targets {
+			let table_name = table_target.to_string();
+			let table =
+				txn.expect_tb_by_name(self.opt.ns()?, self.opt.db()?, &table_target).await?;
 			for (policy_index, policy) in table.ratelimits.iter().enumerate() {
 				if !policy.actions.contains(&action) {
 					continue;
@@ -1936,7 +1964,9 @@ impl Executor {
 					)
 				);
 			let counters = executor.install_statement_counters();
+			executor.set_partial_truncation_allowed(statement_read_only);
 			let result = executor.execute_plan_in_transaction(Arc::clone(&tx), &start, expr).await;
+			executor.set_partial_truncation_allowed(false);
 
 			let time = start.elapsed();
 			let query_result = match result {
@@ -1945,13 +1975,13 @@ impl Executor {
 					result: crate::val::convert_value_to_public_value(value)
 						.map_err(|e| TypesError::internal(e.to_string())),
 					query_type: QueryType::Other,
-					partial: None,
+					partial: executor.partial_reason_for_result(false),
 				},
 				Err(ControlFlow::Err(e)) => QueryResult {
 					time,
 					result: Err(types_error_from_anyhow(e)),
 					query_type: QueryType::Other,
-					partial: None,
+					partial: executor.partial_reason_for_result(true),
 				},
 				Err(ControlFlow::Continue) | Err(ControlFlow::Break) => QueryResult {
 					time,
@@ -2206,7 +2236,9 @@ impl Executor {
 					// iterators can record affected rows independently of
 					// the post-RETURN value shape.
 					let counters = this.install_statement_counters();
+					this.set_partial_truncation_allowed(statement_read_only);
 					let result = this.execute_bare_statement(kvs, &start, stmt).await;
+					this.set_partial_truncation_allowed(false);
 					let outcome = Outcome::from(&result);
 					let result_rows = Self::count_result_rows(
 						statement_type,
@@ -2242,11 +2274,12 @@ impl Executor {
 							Ok(value) => Ok(convert_value_to_public_value(value)?),
 							Err(err) => Err(types_error_from_anyhow(err)),
 						};
+						let partial = this.partial_reason_for_result(result.is_err());
 						this.results.push(QueryResult {
 							time: start.elapsed(),
 							result,
 							query_type,
-							partial: None,
+							partial,
 						});
 					}
 				}
@@ -2260,7 +2293,7 @@ impl Executor {
 
 #[cfg(test)]
 mod tests {
-	use crate::dbs::Session;
+	use crate::dbs::{PartialReason, Session};
 	use crate::iam::{Level, Role};
 	use crate::kvs::Datastore;
 
@@ -2478,6 +2511,72 @@ mod tests {
 		let res = ds.execute("SELECT * FROM person", &sess, None).await.unwrap();
 		let err = res[0].result.as_ref().unwrap_err().to_string();
 		assert!(err.contains("result rows"), "expected result row budget error, got: {err}");
+	}
+
+	#[tokio::test]
+	async fn inline_table_ratelimit_applies_to_record_id_targets() {
+		let ds = Datastore::new("memory").await.unwrap();
+		let sess = Session::owner().with_ns("NS").with_db("DB");
+
+		ds.execute(
+			"DEFINE NAMESPACE NS; USE NS NS; DEFINE DATABASE DB; \
+			 DEFINE TABLE person RATELIMIT FOR SELECT BY $session.id LIMIT 1 PER 1h; \
+			 CREATE person:1;",
+			&sess,
+			None,
+		)
+		.await
+		.unwrap();
+
+		ds.execute("SELECT * FROM person:1", &sess, None).await.unwrap()[0]
+			.result
+			.as_ref()
+			.unwrap();
+		let res = ds.execute("SELECT * FROM person:1", &sess, None).await.unwrap();
+		assert!(res[0].result.as_ref().unwrap_err().to_string().contains("rate limit"));
+	}
+
+	#[tokio::test]
+	async fn inline_table_ratelimit_applies_to_insert_targets() {
+		let ds = Datastore::new("memory").await.unwrap();
+		let sess = Session::owner().with_ns("NS").with_db("DB");
+
+		ds.execute(
+			"DEFINE NAMESPACE NS; USE NS NS; DEFINE DATABASE DB; \
+			 DEFINE TABLE person RATELIMIT FOR CREATE BY $session.id LIMIT 1 PER 1h;",
+			&sess,
+			None,
+		)
+		.await
+		.unwrap();
+
+		ds.execute("INSERT INTO person [{ id: person:1 }];", &sess, None).await.unwrap()[0]
+			.result
+			.as_ref()
+			.unwrap();
+		let res = ds.execute("INSERT INTO person [{ id: person:2 }];", &sess, None).await.unwrap();
+		assert!(res[0].result.as_ref().unwrap_err().to_string().contains("rate limit"));
+	}
+
+	#[tokio::test]
+	async fn inline_table_ratelimit_scan_budget_returns_partial_batch() {
+		let ds = Datastore::new("memory").await.unwrap();
+		let sess = Session::owner().with_ns("NS").with_db("DB");
+
+		ds.execute(
+			"DEFINE NAMESPACE NS; USE NS NS; DEFINE DATABASE DB; \
+			 DEFINE TABLE person RATELIMIT FOR SELECT BY $session.id LIMIT 100 PER 1s SCAN 2; \
+			 CREATE person:1; CREATE person:2; CREATE person:3;",
+			&sess,
+			None,
+		)
+		.await
+		.unwrap();
+
+		let res = ds.execute("SELECT * FROM person", &sess, None).await.unwrap();
+		let rows = res[0].result.as_ref().unwrap().as_array().unwrap();
+		assert_eq!(rows.len(), 2);
+		assert_eq!(res[0].partial, Some(PartialReason::ScanLimit));
 	}
 
 	#[tokio::test]

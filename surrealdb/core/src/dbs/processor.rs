@@ -32,7 +32,7 @@ fn charge_scanned_record(ctx: &FrozenContext, ite: &mut Iterator) -> Result<bool
 			budget.charge(GovResourceKind::RowRead, 1)?;
 			Ok(true)
 		}
-		ChargeOutcome::Truncated(_) => {
+		ChargeOutcome::Truncated(_, _) => {
 			ite.cancel();
 			Ok(false)
 		}

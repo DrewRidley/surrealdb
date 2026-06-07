@@ -276,12 +276,19 @@ impl ExecOperator for TableScan {
 					Ok(outcome) => outcome,
 					Err(e) => Err(ControlFlow::Err(e))?,
 				};
-				if matches!(charge, ChargeOutcome::Truncated(_)) {
-					break;
-				}
+				let truncated = match charge {
+					ChargeOutcome::Charged => false,
+					ChargeOutcome::Truncated(_, allowed) => {
+						batch.values.truncate(allowed as usize);
+						true
+					}
+				};
 				let cont = pipeline.process_batch(&mut batch.values, &ctx).await?;
 				if !batch.values.is_empty() {
 					yield ValueBatch { values: batch.values };
+				}
+				if truncated {
+					break;
 				}
 				if !cont {
 					break;

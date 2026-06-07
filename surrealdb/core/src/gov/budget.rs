@@ -10,7 +10,10 @@ const NO_TRUNCATION: u64 = u64::MAX;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChargeOutcome {
 	Charged,
-	Truncated(ResourceKind),
+	/// The charge crossed an enforced limit while truncation was allowed.
+	/// The second field is how many units from this charge were still within
+	/// the limit and may be processed before stopping.
+	Truncated(ResourceKind, u64),
 }
 
 /// Whether a resource budget is disabled, observing, or enforcing limits.
@@ -79,8 +82,8 @@ impl ResourceBudget {
 			return Ok(());
 		}
 
-		let used =
-			self.usage[kind.index()].fetch_add(amount, Ordering::Relaxed).saturating_add(amount);
+		let previous = self.usage[kind.index()].fetch_add(amount, Ordering::Relaxed);
+		let used = previous.saturating_add(amount);
 
 		if matches!(self.mode, EnforcementMode::Enforce) {
 			if let Some(limit) = self.limits.limit(kind) {
@@ -103,8 +106,8 @@ impl ResourceBudget {
 			return Ok(ChargeOutcome::Charged);
 		}
 
-		let used =
-			self.usage[kind.index()].fetch_add(amount, Ordering::Relaxed).saturating_add(amount);
+		let previous = self.usage[kind.index()].fetch_add(amount, Ordering::Relaxed);
+		let used = previous.saturating_add(amount);
 
 		if matches!(self.mode, EnforcementMode::Enforce) {
 			if let Some(limit) = self.limits.limit(kind) {
@@ -118,7 +121,8 @@ impl ResourceBudget {
 						.into());
 					}
 					self.mark_truncated(kind);
-					return Ok(ChargeOutcome::Truncated(kind));
+					let allowed = limit.saturating_sub(previous);
+					return Ok(ChargeOutcome::Truncated(kind, allowed));
 				}
 			}
 		}
@@ -199,7 +203,7 @@ mod tests {
 		);
 		assert_eq!(
 			budget.charge_or_truncate(ResourceKind::ScanKey, 3).unwrap(),
-			ChargeOutcome::Truncated(ResourceKind::ScanKey)
+			ChargeOutcome::Truncated(ResourceKind::ScanKey, 2)
 		);
 		assert_eq!(budget.truncated_kind(), Some(ResourceKind::ScanKey));
 	}
