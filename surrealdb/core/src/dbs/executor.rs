@@ -1,3 +1,4 @@
+use std::hash::{Hash, Hasher};
 use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,8 +31,8 @@ use crate::expr::parameterize::expr_to_ident;
 use crate::expr::paths::{DB, NS};
 use crate::expr::plan::LogicalPlan;
 use crate::expr::statements::{OptionStatement, UseStatement};
-use crate::expr::{Base, ControlFlow, Expr, FlowResult, Literal, TopLevelExpr};
-use crate::gov::{ResourceBudget, ResourceKind as GovResourceKind, ResourceLimits};
+use crate::expr::{Base, ControlFlow, Expr, FlowResult, Literal, Part, TopLevelExpr};
+use crate::gov::{ResourceBudget, ResourceKind as GovResourceKind, ResourceLimits, StableHasher};
 use crate::iam::{Action, ResourceKind};
 use crate::kvs::slowlog::SlowLogVisit;
 use crate::kvs::{Datastore, LockType, Transaction, TransactionType};
@@ -129,6 +130,39 @@ impl Executor {
 		*slot = Some(slot.map(|current| current.min(candidate)).unwrap_or(candidate));
 	}
 
+	fn hash_fast_session_ratelimit_bucket<H: Hasher>(&mut self, expr: &Expr, hash: &mut H) -> bool {
+		let Expr::Idiom(idiom) = expr else {
+			return false;
+		};
+		let [Part::Start(Expr::Param(param)), Part::Field(field)] = idiom.0.as_slice() else {
+			return false;
+		};
+		if param.as_str() != "session" {
+			return false;
+		}
+		if !matches!(field.as_str(), "id" | "ip" | "ns" | "db" | "or" | "ac" | "rd" | "tk") {
+			return false;
+		}
+
+		field.hash(hash);
+		let Some(session) = self.get_session_info() else {
+			Value::None.hash(hash);
+			return true;
+		};
+		match field.as_str() {
+			"id" => session.id.hash(hash),
+			"ip" => session.ip.hash(hash),
+			"ns" => session.ns.hash(hash),
+			"db" => session.db.hash(hash),
+			"or" => session.origin.hash(hash),
+			"ac" => session.ac.hash(hash),
+			"rd" => session.rd.hash(hash),
+			"tk" => session.token.hash(hash),
+			_ => return false,
+		}
+		true
+	}
+
 	async fn inline_ratelimit_resource_limits(
 		&mut self,
 		txn: Arc<Transaction>,
@@ -150,8 +184,8 @@ impl Executor {
 					continue;
 				}
 
-				let opt_no_perms = self.opt.new_with_perms(false);
 				if let Some(condition) = &policy.condition {
+					let opt_no_perms = self.opt.new_with_perms(false);
 					let applies = self
 						.stack
 						.enter(|stk| condition.compute(stk, &self.ctx, &opt_no_perms, None))
@@ -163,27 +197,44 @@ impl Executor {
 					}
 				}
 
-				let bucket = self
-					.stack
-					.enter(|stk| policy.bucket.compute(stk, &self.ctx, &opt_no_perms, None))
-					.finish()
-					.await?;
-				let key = format!(
-					"{}:{}:{}:{:?}:{}:{}",
-					self.opt.ns()?,
-					self.opt.db()?,
-					table_name,
-					action,
-					policy_index,
-					bucket.to_sql(),
+				let mut key = StableHasher::new();
+				self.opt.ns()?.hash(&mut key);
+				self.opt.db()?.hash(&mut key);
+				table_name.hash(&mut key);
+				action.as_str().hash(&mut key);
+				policy_index.hash(&mut key);
+				if !self.hash_fast_session_ratelimit_bucket(&policy.bucket, &mut key) {
+					let opt_no_perms = self.opt.new_with_perms(false);
+					let bucket = self
+						.stack
+						.enter(|stk| policy.bucket.compute(stk, &self.ctx, &opt_no_perms, None))
+						.finish()
+						.await?;
+					bucket.hash(&mut key);
+				}
+				let key = key.finish();
+				let locally_admitted = self.ctx.rate_limiter().admit_local_hash(
+					key,
+					policy.limit,
+					policy.period,
+					policy.burst,
 				);
+				if locally_admitted {
+					if let Some(limit) = policy.scan {
+						Self::merge_limit(&mut scan, limit);
+					}
+					if let Some(limit) = policy.result {
+						Self::merge_limit(&mut result, limit);
+					}
+					continue;
+				}
 				if !txn.writeable() {
 					return Err(ControlFlow::Err(anyhow::Error::new(RateLimitRequiresWrite)));
 				}
 				if !self
 					.ctx
 					.rate_limiter()
-					.admit_kv(&txn, key, policy.limit, policy.period, policy.burst)
+					.admit_kv_hash(&txn, key, policy.limit, policy.period, policy.burst)
 					.await?
 				{
 					return Err(ControlFlow::Err(anyhow::Error::new(Error::RateLimitExceeded {

@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::hash::Hasher;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
@@ -8,9 +11,69 @@ use crate::kvs::{Error as KvsError, Transaction};
 #[derive(Debug, Default)]
 pub(crate) struct RateLimiter {
 	cleanup_counter: AtomicU64,
+	local_leases: Mutex<HashMap<u64, LocalLease>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LocalLease {
+	tokens: u64,
+	expires_at_ms: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct StableHasher {
+	hash: u64,
+}
+
+impl Default for StableHasher {
+	fn default() -> Self {
+		Self {
+			hash: 0xcbf29ce484222325,
+		}
+	}
+}
+
+impl StableHasher {
+	pub(crate) fn new() -> Self {
+		Self::default()
+	}
+}
+
+impl Hasher for StableHasher {
+	fn finish(&self) -> u64 {
+		self.hash
+	}
+
+	fn write(&mut self, bytes: &[u8]) {
+		self.hash = stable_hash_extend(self.hash, bytes);
+	}
 }
 
 impl RateLimiter {
+	pub(crate) fn admit_local_hash(
+		&self,
+		key_hash: u64,
+		limit: u64,
+		period: Duration,
+		burst: Option<u64>,
+	) -> bool {
+		if limit == 0 {
+			return false;
+		}
+		self.take_local_lease(local_cache_key(key_hash, limit, period, burst), now_millis())
+	}
+
+	pub(crate) async fn admit_kv_hash(
+		&self,
+		txn: &Transaction,
+		key_hash: u64,
+		limit: u64,
+		period: Duration,
+		burst: Option<u64>,
+	) -> Result<bool> {
+		self.admit_kv_inner(txn, key_hash, limit, period, burst).await
+	}
+
 	pub(crate) async fn admit_kv(
 		&self,
 		txn: &Transaction,
@@ -19,13 +82,30 @@ impl RateLimiter {
 		period: Duration,
 		burst: Option<u64>,
 	) -> Result<bool> {
+		self.admit_kv_inner(txn, stable_hash(key.as_bytes()), limit, period, burst).await
+	}
+
+	async fn admit_kv_inner(
+		&self,
+		txn: &Transaction,
+		key_hash: u64,
+		limit: u64,
+		period: Duration,
+		burst: Option<u64>,
+	) -> Result<bool> {
 		if limit == 0 {
 			return Ok(false);
 		}
-		let capacity = burst.unwrap_or(limit).max(1) as f64;
+		let capacity_u64 = burst.unwrap_or(limit).max(1);
+		let capacity = capacity_u64 as f64;
 		let refill_per_second = limit as f64 / period.as_secs_f64().max(f64::EPSILON);
 		let now_ms = now_millis();
-		let key = kv_key(&key);
+		let local_key = local_cache_key(key_hash, limit, period, burst);
+		if self.take_local_lease(local_key, now_ms) {
+			return Ok(true);
+		}
+		let reservation = reservation_size(limit, capacity_u64);
+		let key = kv_key(key_hash);
 		let old = txn.get(&key, None).await?;
 		let mut bucket = old
 			.as_deref()
@@ -49,13 +129,47 @@ impl RateLimiter {
 			self.cleanup_expired(txn, now_ms).await?;
 			return Ok(false);
 		}
-		bucket.tokens -= 1.0;
+		let granted = reservation.min(bucket.tokens.floor() as u64).max(1);
+		bucket.tokens -= granted as f64;
 		let new = encode_bucket(&bucket);
 		if !put_bucket(txn, &key, &new, old.as_ref()).await? {
 			return Ok(false);
 		}
+		if granted > 1 {
+			self.store_local_lease(local_key, granted - 1, bucket.expires_at_ms);
+		}
 		self.cleanup_expired(txn, now_ms).await?;
 		Ok(true)
+	}
+
+	fn take_local_lease(&self, key: u64, now_ms: u64) -> bool {
+		let mut leases = self.local_leases.lock().unwrap_or_else(|e| e.into_inner());
+		let Some(lease) = leases.get_mut(&key) else {
+			return false;
+		};
+		if lease.expires_at_ms <= now_ms || lease.tokens == 0 {
+			leases.remove(&key);
+			return false;
+		}
+		lease.tokens -= 1;
+		if lease.tokens == 0 {
+			leases.remove(&key);
+		}
+		true
+	}
+
+	fn store_local_lease(&self, key: u64, tokens: u64, expires_at_ms: u64) {
+		if tokens == 0 {
+			return;
+		}
+		let mut leases = self.local_leases.lock().unwrap_or_else(|e| e.into_inner());
+		leases.insert(
+			key,
+			LocalLease {
+				tokens,
+				expires_at_ms,
+			},
+		);
 	}
 
 	async fn cleanup_expired(&self, txn: &Transaction, now_ms: u64) -> Result<()> {
@@ -100,14 +214,29 @@ fn expiry_millis(now_ms: u64, period: Duration, capacity: f64, refill_per_second
 		.saturating_add(period.as_millis().try_into().unwrap_or(u64::MAX))
 }
 
-fn kv_key(key: &str) -> Vec<u8> {
+fn kv_key(key_hash: u64) -> Vec<u8> {
 	let mut out = RATE_LIMIT_PREFIX.to_vec();
-	out.extend_from_slice(&stable_hash(key.as_bytes()).to_be_bytes());
+	out.extend_from_slice(&key_hash.to_be_bytes());
 	out
 }
 
+fn reservation_size(limit: u64, capacity: u64) -> u64 {
+	capacity.min(limit.max(1)).min(1024).max(1)
+}
+
+fn local_cache_key(key_hash: u64, limit: u64, period: Duration, burst: Option<u64>) -> u64 {
+	let mut hash = key_hash;
+	hash = stable_hash_extend(hash, &limit.to_be_bytes());
+	hash = stable_hash_extend(hash, &period.as_millis().to_be_bytes());
+	hash = stable_hash_extend(hash, &burst.unwrap_or(0).to_be_bytes());
+	hash
+}
+
 fn stable_hash(bytes: &[u8]) -> u64 {
-	let mut hash = 0xcbf29ce484222325_u64;
+	stable_hash_extend(0xcbf29ce484222325_u64, bytes)
+}
+
+fn stable_hash_extend(mut hash: u64, bytes: &[u8]) -> u64 {
 	for byte in bytes {
 		hash ^= u64::from(*byte);
 		hash = hash.wrapping_mul(0x100000001b3);
