@@ -20,14 +20,14 @@ pub(crate) struct RateLimiter {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum FastRatelimitBucket {
-	SessionId,
-	SessionIp,
-	SessionNs,
-	SessionDb,
-	SessionOrigin,
-	SessionAuth,
-	SessionRecord,
-	SessionToken,
+	Id,
+	Ip,
+	Ns,
+	Db,
+	Origin,
+	Auth,
+	Record,
+	Token,
 }
 
 #[derive(Clone, Debug)]
@@ -235,7 +235,7 @@ impl RateLimiter {
 	}
 
 	async fn cleanup_expired(&self, txn: &Transaction, now_ms: u64) -> Result<()> {
-		if self.cleanup_counter.fetch_add(1, Ordering::Relaxed) % 256 != 0 {
+		if !self.cleanup_counter.fetch_add(1, Ordering::Relaxed).is_multiple_of(256) {
 			return Ok(());
 		}
 		let start = RATE_LIMIT_PREFIX.to_vec();
@@ -283,7 +283,7 @@ fn kv_key(key_hash: u64) -> Vec<u8> {
 }
 
 fn reservation_size(limit: u64, capacity: u64) -> u64 {
-	capacity.min(limit.max(1)).min(1024).max(1)
+	capacity.min(limit.max(1)).clamp(1, 1024)
 }
 
 fn local_cache_key(key_hash: u64, limit: u64, period: Duration, burst: Option<u64>) -> u64 {

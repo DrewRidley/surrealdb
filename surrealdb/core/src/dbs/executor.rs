@@ -52,6 +52,8 @@ const TARGET: &str = "surrealdb::core::dbs";
 #[derive(Debug)]
 struct RateLimitRequiresWrite;
 
+type TableRatelimitTargets = (catalog::PermissionKind, Vec<TableName>);
+
 impl std::fmt::Display for RateLimitRequiresWrite {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		f.write_str("rate limit admission requires a writable transaction")
@@ -81,9 +83,7 @@ pub struct Executor {
 }
 
 impl Executor {
-	fn table_ratelimit_target_names(
-		plan: &TopLevelExpr,
-	) -> Option<(catalog::PermissionKind, Vec<TableName>)> {
+	fn table_ratelimit_target_names(plan: &TopLevelExpr) -> Option<TableRatelimitTargets> {
 		fn target_name(expr: &Expr) -> Option<TableName> {
 			match expr {
 				Expr::Table(table) => Some(table.clone()),
@@ -144,14 +144,14 @@ impl Executor {
 			return None;
 		}
 		match field.as_str() {
-			"id" => Some(FastRatelimitBucket::SessionId),
-			"ip" => Some(FastRatelimitBucket::SessionIp),
-			"ns" => Some(FastRatelimitBucket::SessionNs),
-			"db" => Some(FastRatelimitBucket::SessionDb),
-			"or" => Some(FastRatelimitBucket::SessionOrigin),
-			"ac" => Some(FastRatelimitBucket::SessionAuth),
-			"rd" => Some(FastRatelimitBucket::SessionRecord),
-			"tk" => Some(FastRatelimitBucket::SessionToken),
+			"id" => Some(FastRatelimitBucket::Id),
+			"ip" => Some(FastRatelimitBucket::Ip),
+			"ns" => Some(FastRatelimitBucket::Ns),
+			"db" => Some(FastRatelimitBucket::Db),
+			"or" => Some(FastRatelimitBucket::Origin),
+			"ac" => Some(FastRatelimitBucket::Auth),
+			"rd" => Some(FastRatelimitBucket::Record),
+			"tk" => Some(FastRatelimitBucket::Token),
 			_ => None,
 		}
 	}
@@ -167,14 +167,14 @@ impl Executor {
 			return;
 		};
 		match bucket {
-			FastRatelimitBucket::SessionId => session.id.hash(hash),
-			FastRatelimitBucket::SessionIp => session.ip.hash(hash),
-			FastRatelimitBucket::SessionNs => session.ns.hash(hash),
-			FastRatelimitBucket::SessionDb => session.db.hash(hash),
-			FastRatelimitBucket::SessionOrigin => session.origin.hash(hash),
-			FastRatelimitBucket::SessionAuth => session.ac.hash(hash),
-			FastRatelimitBucket::SessionRecord => session.rd.hash(hash),
-			FastRatelimitBucket::SessionToken => session.token.hash(hash),
+			FastRatelimitBucket::Id => session.id.hash(hash),
+			FastRatelimitBucket::Ip => session.ip.hash(hash),
+			FastRatelimitBucket::Ns => session.ns.hash(hash),
+			FastRatelimitBucket::Db => session.db.hash(hash),
+			FastRatelimitBucket::Origin => session.origin.hash(hash),
+			FastRatelimitBucket::Auth => session.ac.hash(hash),
+			FastRatelimitBucket::Record => session.rd.hash(hash),
+			FastRatelimitBucket::Token => session.token.hash(hash),
 		}
 	}
 
@@ -224,9 +224,9 @@ impl Executor {
 	async fn inline_ratelimit_resource_limits(
 		&mut self,
 		txn: Arc<Transaction>,
-		plan: &TopLevelExpr,
+		table_ratelimit_targets: Option<&TableRatelimitTargets>,
 	) -> FlowResult<Option<ResourceLimits>> {
-		let Some((action, targets)) = Self::table_ratelimit_target_names(plan) else {
+		let Some((action, targets)) = table_ratelimit_targets else {
 			return Ok(None);
 		};
 
@@ -257,12 +257,15 @@ impl Executor {
 				continue;
 			}
 
-			let table =
-				txn.expect_tb_by_name(self.opt.ns()?, self.opt.db()?, &table_target).await?;
+			let Some(table) =
+				txn.get_tb_by_name(self.opt.ns()?, self.opt.db()?, table_target, None).await?
+			else {
+				continue;
+			};
 			let mut cacheable = true;
 			let mut cached_policies = Vec::new();
 			for (policy_index, policy) in table.ratelimits.iter().enumerate() {
-				if !policy.actions.contains(&action) {
+				if !policy.actions.contains(action) {
 					continue;
 				}
 
@@ -380,6 +383,7 @@ impl Executor {
 		&mut self,
 		txn: Arc<Transaction>,
 		plan: &TopLevelExpr,
+		table_ratelimit_targets: Option<&TableRatelimitTargets>,
 	) -> FlowResult<()> {
 		let ctx = Arc::get_mut(&mut self.ctx).ok_or_else(|| {
 			anyhow::Error::new(Error::unreachable(
@@ -389,7 +393,7 @@ impl Executor {
 		ctx.set_transaction(Arc::clone(&txn));
 
 		let budget = self
-			.inline_ratelimit_resource_limits(txn, plan)
+			.inline_ratelimit_resource_limits(txn, table_ratelimit_targets)
 			.await?
 			.map(ResourceBudget::enforcing)
 			.map(Arc::new);
@@ -1013,8 +1017,10 @@ impl Executor {
 		txn: Arc<Transaction>,
 		start: &Instant,
 		plan: TopLevelExpr,
+		table_ratelimit_targets: Option<&TableRatelimitTargets>,
 	) -> FlowResult<Value> {
-		self.install_inline_ratelimit_budget(Arc::clone(&txn), &plan).await?;
+		self.install_inline_ratelimit_budget(Arc::clone(&txn), &plan, table_ratelimit_targets)
+			.await?;
 
 		/// Helper method to get mutable access to the context
 		macro_rules! ctx_mut {
@@ -1408,12 +1414,18 @@ impl Executor {
 			kvs.live_query_broker(),
 		);
 		let retry_plan = matches!(transaction_type, TransactionType::Read).then(|| plan.clone());
+		let table_ratelimit_targets = Self::table_ratelimit_target_names(&plan);
 
 		let exec_result = match kvs.transaction_timeout() {
 			Some(timeout) => {
 				match tokio::time::timeout(
 					timeout,
-					self.execute_plan_in_transaction(Arc::clone(&txn), start, plan),
+					self.execute_plan_in_transaction(
+						Arc::clone(&txn),
+						start,
+						plan,
+						table_ratelimit_targets.as_ref(),
+					),
 				)
 				.await
 				{
@@ -1424,7 +1436,15 @@ impl Executor {
 					}
 				}
 			}
-			None => self.execute_plan_in_transaction(Arc::clone(&txn), start, plan).await,
+			None => {
+				self.execute_plan_in_transaction(
+					Arc::clone(&txn),
+					start,
+					plan,
+					table_ratelimit_targets.as_ref(),
+				)
+				.await
+			}
 		};
 
 		match exec_result {
@@ -1457,11 +1477,10 @@ impl Executor {
 			}
 			Err(ControlFlow::Err(e)) => {
 				let _ = txn.cancel().await;
-				if e.downcast_ref::<RateLimitRequiresWrite>().is_some() {
-					if let Some(plan) = retry_plan {
-						return Box::pin(self.execute_plan_impl_inner(kvs, start, plan, true))
-							.await;
-					}
+				if let (true, Some(plan)) =
+					(e.downcast_ref::<RateLimitRequiresWrite>().is_some(), retry_plan)
+				{
+					return Box::pin(self.execute_plan_impl_inner(kvs, start, plan, true)).await;
 				}
 				Err(e)
 			}
@@ -1927,6 +1946,7 @@ impl Executor {
 				stmt => {
 					// reintroduce planner later.
 					let plan = stmt;
+					let table_ratelimit_targets = Self::table_ratelimit_target_names(&plan);
 
 					// Install fresh per-statement counters so DML
 					// iterators inside this BEGIN/COMMIT block can
@@ -1934,8 +1954,14 @@ impl Executor {
 					// post-RETURN value shape.
 					let counters = self.install_statement_counters();
 					self.set_partial_truncation_allowed(statement_read_only);
-					let execution =
-						self.execute_plan_in_transaction(Arc::clone(&txn), &before, plan).await;
+					let execution = self
+						.execute_plan_in_transaction(
+							Arc::clone(&txn),
+							&before,
+							plan,
+							table_ratelimit_targets.as_ref(),
+						)
+						.await;
 					self.set_partial_truncation_allowed(false);
 					let r: Result<Value> = match execution {
 						Ok(x) => Ok(x),
@@ -2125,9 +2151,17 @@ impl Executor {
 						Expr::Select(_) | Expr::Info(_) | Expr::Explain { .. }
 					)
 				);
+			let table_ratelimit_targets = Self::table_ratelimit_target_names(&expr);
 			let counters = executor.install_statement_counters();
 			executor.set_partial_truncation_allowed(statement_read_only);
-			let result = executor.execute_plan_in_transaction(Arc::clone(&tx), &start, expr).await;
+			let result = executor
+				.execute_plan_in_transaction(
+					Arc::clone(&tx),
+					&start,
+					expr,
+					table_ratelimit_targets.as_ref(),
+				)
+				.await;
 			executor.set_partial_truncation_allowed(false);
 
 			let time = start.elapsed();

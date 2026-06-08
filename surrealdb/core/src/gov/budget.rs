@@ -85,17 +85,16 @@ impl ResourceBudget {
 		let previous = self.usage[kind.index()].fetch_add(amount, Ordering::Relaxed);
 		let used = previous.saturating_add(amount);
 
-		if matches!(self.mode, EnforcementMode::Enforce) {
-			if let Some(limit) = self.limits.limit(kind) {
-				if used > limit {
-					return Err(Error::QueryResourceExceeded {
-						resource: kind.label(),
-						limit,
-						used,
-					}
-					.into());
+		match self.limits.limit(kind) {
+			Some(limit) if matches!(self.mode, EnforcementMode::Enforce) && used > limit => {
+				return Err(Error::QueryResourceExceeded {
+					resource: kind.label(),
+					limit,
+					used,
 				}
+				.into());
 			}
+			_ => {}
 		}
 
 		Ok(())
@@ -109,22 +108,21 @@ impl ResourceBudget {
 		let previous = self.usage[kind.index()].fetch_add(amount, Ordering::Relaxed);
 		let used = previous.saturating_add(amount);
 
-		if matches!(self.mode, EnforcementMode::Enforce) {
-			if let Some(limit) = self.limits.limit(kind) {
-				if used > limit {
-					if !self.truncation_allowed.load(Ordering::Relaxed) {
-						return Err(Error::QueryResourceExceeded {
-							resource: kind.label(),
-							limit,
-							used,
-						}
-						.into());
+		match self.limits.limit(kind) {
+			Some(limit) if matches!(self.mode, EnforcementMode::Enforce) && used > limit => {
+				if !self.truncation_allowed.load(Ordering::Relaxed) {
+					return Err(Error::QueryResourceExceeded {
+						resource: kind.label(),
+						limit,
+						used,
 					}
-					self.mark_truncated(kind);
-					let allowed = limit.saturating_sub(previous);
-					return Ok(ChargeOutcome::Truncated(kind, allowed));
+					.into());
 				}
+				self.mark_truncated(kind);
+				let allowed = limit.saturating_sub(previous);
+				return Ok(ChargeOutcome::Truncated(kind, allowed));
 			}
+			_ => {}
 		}
 
 		Ok(ChargeOutcome::Charged)
