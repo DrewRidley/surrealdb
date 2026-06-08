@@ -161,6 +161,7 @@ impl DefineTableStatement {
 
 		// Clear the cache
 		txn.clear_cache();
+		ctx.rate_limiter().clear_table_plans();
 
 		let parent = NsDbCtx {
 			ns: Arc::clone(&ns),
@@ -220,6 +221,7 @@ impl DefineTableStatement {
 		}
 		// Clear the cache
 		txn.clear_cache();
+		ctx.rate_limiter().clear_table_plans();
 		// Ok all good
 		Ok(Value::None)
 	}

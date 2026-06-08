@@ -9,5 +9,5 @@ mod ratelimit;
 mod usage;
 
 pub use budget::{ChargeOutcome, EnforcementMode, ResourceBudget, ResourceLimits};
-pub(crate) use ratelimit::{RateLimiter, StableHasher};
+pub(crate) use ratelimit::{CachedRatelimitPolicy, FastRatelimitBucket, RateLimiter, StableHasher};
 pub use usage::{ResourceKind, ResourceUsageSnapshot};

@@ -32,7 +32,10 @@ use crate::expr::paths::{DB, NS};
 use crate::expr::plan::LogicalPlan;
 use crate::expr::statements::{OptionStatement, UseStatement};
 use crate::expr::{Base, ControlFlow, Expr, FlowResult, Literal, Part, TopLevelExpr};
-use crate::gov::{ResourceBudget, ResourceKind as GovResourceKind, ResourceLimits, StableHasher};
+use crate::gov::{
+	CachedRatelimitPolicy, FastRatelimitBucket, ResourceBudget, ResourceKind as GovResourceKind,
+	ResourceLimits, StableHasher,
+};
 use crate::iam::{Action, ResourceKind};
 use crate::kvs::slowlog::SlowLogVisit;
 use crate::kvs::{Datastore, LockType, Transaction, TransactionType};
@@ -130,37 +133,92 @@ impl Executor {
 		*slot = Some(slot.map(|current| current.min(candidate)).unwrap_or(candidate));
 	}
 
-	fn hash_fast_session_ratelimit_bucket<H: Hasher>(&mut self, expr: &Expr, hash: &mut H) -> bool {
+	fn fast_ratelimit_bucket(expr: &Expr) -> Option<FastRatelimitBucket> {
 		let Expr::Idiom(idiom) = expr else {
-			return false;
+			return None;
 		};
 		let [Part::Start(Expr::Param(param)), Part::Field(field)] = idiom.0.as_slice() else {
-			return false;
+			return None;
 		};
 		if param.as_str() != "session" {
-			return false;
+			return None;
 		}
-		if !matches!(field.as_str(), "id" | "ip" | "ns" | "db" | "or" | "ac" | "rd" | "tk") {
-			return false;
+		match field.as_str() {
+			"id" => Some(FastRatelimitBucket::SessionId),
+			"ip" => Some(FastRatelimitBucket::SessionIp),
+			"ns" => Some(FastRatelimitBucket::SessionNs),
+			"db" => Some(FastRatelimitBucket::SessionDb),
+			"or" => Some(FastRatelimitBucket::SessionOrigin),
+			"ac" => Some(FastRatelimitBucket::SessionAuth),
+			"rd" => Some(FastRatelimitBucket::SessionRecord),
+			"tk" => Some(FastRatelimitBucket::SessionToken),
+			_ => None,
 		}
+	}
 
-		field.hash(hash);
+	fn hash_fast_session_ratelimit_bucket<H: Hasher>(
+		&mut self,
+		bucket: FastRatelimitBucket,
+		hash: &mut H,
+	) {
+		bucket.hash(hash);
 		let Some(session) = self.get_session_info() else {
 			Value::None.hash(hash);
-			return true;
+			return;
 		};
-		match field.as_str() {
-			"id" => session.id.hash(hash),
-			"ip" => session.ip.hash(hash),
-			"ns" => session.ns.hash(hash),
-			"db" => session.db.hash(hash),
-			"or" => session.origin.hash(hash),
-			"ac" => session.ac.hash(hash),
-			"rd" => session.rd.hash(hash),
-			"tk" => session.token.hash(hash),
-			_ => return false,
+		match bucket {
+			FastRatelimitBucket::SessionId => session.id.hash(hash),
+			FastRatelimitBucket::SessionIp => session.ip.hash(hash),
+			FastRatelimitBucket::SessionNs => session.ns.hash(hash),
+			FastRatelimitBucket::SessionDb => session.db.hash(hash),
+			FastRatelimitBucket::SessionOrigin => session.origin.hash(hash),
+			FastRatelimitBucket::SessionAuth => session.ac.hash(hash),
+			FastRatelimitBucket::SessionRecord => session.rd.hash(hash),
+			FastRatelimitBucket::SessionToken => session.token.hash(hash),
 		}
-		true
+	}
+
+	async fn admit_cached_table_ratelimit_policy(
+		&mut self,
+		txn: &Transaction,
+		table_name: &str,
+		policy: &CachedRatelimitPolicy,
+		scan: &mut Option<u64>,
+		result: &mut Option<u64>,
+	) -> FlowResult<()> {
+		let mut key = StableHasher::from_hash(policy.key_seed);
+		self.hash_fast_session_ratelimit_bucket(policy.bucket, &mut key);
+		let key = key.finish();
+
+		let locally_admitted = self.ctx.rate_limiter().admit_local_hash(
+			key,
+			policy.limit,
+			policy.period,
+			policy.burst,
+		);
+		if !locally_admitted {
+			if !txn.writeable() {
+				return Err(ControlFlow::Err(anyhow::Error::new(RateLimitRequiresWrite)));
+			}
+			if !self
+				.ctx
+				.rate_limiter()
+				.admit_kv_hash(txn, key, policy.limit, policy.period, policy.burst)
+				.await?
+			{
+				return Err(ControlFlow::Err(anyhow::Error::new(Error::RateLimitExceeded {
+					scope: format!("table {table_name}"),
+				})));
+			}
+		}
+
+		if let Some(limit) = policy.scan {
+			Self::merge_limit(scan, limit);
+		}
+		if let Some(limit) = policy.result {
+			Self::merge_limit(result, limit);
+		}
+		Ok(())
 	}
 
 	async fn inline_ratelimit_resource_limits(
@@ -177,14 +235,39 @@ impl Executor {
 
 		for table_target in targets {
 			let table_name = table_target.to_string();
+			let mut plan_key = StableHasher::new();
+			self.opt.ns()?.hash(&mut plan_key);
+			self.opt.db()?.hash(&mut plan_key);
+			table_name.hash(&mut plan_key);
+			action.as_str().hash(&mut plan_key);
+			let plan_key = plan_key.finish();
+			let key_seed = StableHasher::from_hash(plan_key);
+
+			if let Some(cached) = self.ctx.rate_limiter().cached_table_plan_by_key(plan_key) {
+				for policy in cached.iter() {
+					self.admit_cached_table_ratelimit_policy(
+						&txn,
+						&table_name,
+						policy,
+						&mut scan,
+						&mut result,
+					)
+					.await?;
+				}
+				continue;
+			}
+
 			let table =
 				txn.expect_tb_by_name(self.opt.ns()?, self.opt.db()?, &table_target).await?;
+			let mut cacheable = true;
+			let mut cached_policies = Vec::new();
 			for (policy_index, policy) in table.ratelimits.iter().enumerate() {
 				if !policy.actions.contains(&action) {
 					continue;
 				}
 
 				if let Some(condition) = &policy.condition {
+					cacheable = false;
 					let opt_no_perms = self.opt.new_with_perms(false);
 					let applies = self
 						.stack
@@ -197,21 +280,50 @@ impl Executor {
 					}
 				}
 
+				let cached = if policy.condition.is_none() {
+					Self::fast_ratelimit_bucket(&policy.bucket).map(|bucket| {
+						let mut key_seed = StableHasher::from_hash(key_seed.finish());
+						policy_index.hash(&mut key_seed);
+						CachedRatelimitPolicy {
+							bucket,
+							key_seed: key_seed.finish(),
+							limit: policy.limit,
+							period: policy.period,
+							burst: policy.burst,
+							scan: policy.scan,
+							result: policy.result,
+						}
+					})
+				} else {
+					None
+				};
+				if let Some(cached) = cached {
+					self.admit_cached_table_ratelimit_policy(
+						&txn,
+						&table_name,
+						&cached,
+						&mut scan,
+						&mut result,
+					)
+					.await?;
+					cached_policies.push(cached);
+					continue;
+				}
+
+				cacheable = false;
 				let mut key = StableHasher::new();
 				self.opt.ns()?.hash(&mut key);
 				self.opt.db()?.hash(&mut key);
 				table_name.hash(&mut key);
 				action.as_str().hash(&mut key);
 				policy_index.hash(&mut key);
-				if !self.hash_fast_session_ratelimit_bucket(&policy.bucket, &mut key) {
-					let opt_no_perms = self.opt.new_with_perms(false);
-					let bucket = self
-						.stack
-						.enter(|stk| policy.bucket.compute(stk, &self.ctx, &opt_no_perms, None))
-						.finish()
-						.await?;
-					bucket.hash(&mut key);
-				}
+				let opt_no_perms = self.opt.new_with_perms(false);
+				let bucket = self
+					.stack
+					.enter(|stk| policy.bucket.compute(stk, &self.ctx, &opt_no_perms, None))
+					.finish()
+					.await?;
+				bucket.hash(&mut key);
 				let key = key.finish();
 				let locally_admitted = self.ctx.rate_limiter().admit_local_hash(
 					key,
@@ -219,27 +331,22 @@ impl Executor {
 					policy.period,
 					policy.burst,
 				);
-				if locally_admitted {
-					if let Some(limit) = policy.scan {
-						Self::merge_limit(&mut scan, limit);
+				if !locally_admitted {
+					if !txn.writeable() {
+						return Err(ControlFlow::Err(anyhow::Error::new(RateLimitRequiresWrite)));
 					}
-					if let Some(limit) = policy.result {
-						Self::merge_limit(&mut result, limit);
+					if !self
+						.ctx
+						.rate_limiter()
+						.admit_kv_hash(&txn, key, policy.limit, policy.period, policy.burst)
+						.await?
+					{
+						return Err(ControlFlow::Err(anyhow::Error::new(
+							Error::RateLimitExceeded {
+								scope: format!("table {table_name}"),
+							},
+						)));
 					}
-					continue;
-				}
-				if !txn.writeable() {
-					return Err(ControlFlow::Err(anyhow::Error::new(RateLimitRequiresWrite)));
-				}
-				if !self
-					.ctx
-					.rate_limiter()
-					.admit_kv_hash(&txn, key, policy.limit, policy.period, policy.burst)
-					.await?
-				{
-					return Err(ControlFlow::Err(anyhow::Error::new(Error::RateLimitExceeded {
-						scope: format!("table {table_name}"),
-					})));
 				}
 
 				if let Some(limit) = policy.scan {
@@ -248,6 +355,10 @@ impl Executor {
 				if let Some(limit) = policy.result {
 					Self::merge_limit(&mut result, limit);
 				}
+			}
+
+			if cacheable {
+				self.ctx.rate_limiter().store_table_plan(plan_key, cached_policies);
 			}
 		}
 

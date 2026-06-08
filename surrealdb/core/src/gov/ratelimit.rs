@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::hash::Hasher;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -11,13 +12,38 @@ use crate::kvs::{Error as KvsError, Transaction};
 #[derive(Debug, Default)]
 pub(crate) struct RateLimiter {
 	cleanup_counter: AtomicU64,
-	local_leases: Mutex<HashMap<u64, LocalLease>>,
+	hot_lease_key: AtomicU64,
+	hot_lease_tokens: AtomicU64,
+	hot_lease_expires_at_ms: AtomicU64,
+	table_plans: Mutex<HashMap<u64, CachedTableRatelimitPlan>>,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct LocalLease {
-	tokens: u64,
-	expires_at_ms: u64,
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum FastRatelimitBucket {
+	SessionId,
+	SessionIp,
+	SessionNs,
+	SessionDb,
+	SessionOrigin,
+	SessionAuth,
+	SessionRecord,
+	SessionToken,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CachedRatelimitPolicy {
+	pub(crate) bucket: FastRatelimitBucket,
+	pub(crate) key_seed: u64,
+	pub(crate) limit: u64,
+	pub(crate) period: Duration,
+	pub(crate) burst: Option<u64>,
+	pub(crate) scan: Option<u64>,
+	pub(crate) result: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct CachedTableRatelimitPlan {
+	policies: Arc<Vec<CachedRatelimitPolicy>>,
 }
 
 #[derive(Debug)]
@@ -37,6 +63,12 @@ impl StableHasher {
 	pub(crate) fn new() -> Self {
 		Self::default()
 	}
+
+	pub(crate) fn from_hash(hash: u64) -> Self {
+		Self {
+			hash,
+		}
+	}
 }
 
 impl Hasher for StableHasher {
@@ -50,6 +82,34 @@ impl Hasher for StableHasher {
 }
 
 impl RateLimiter {
+	pub(crate) fn cached_table_plan_by_key(
+		&self,
+		key: u64,
+	) -> Option<Arc<Vec<CachedRatelimitPolicy>>> {
+		let plans = self.table_plans.lock().unwrap_or_else(|e| e.into_inner());
+		plans.get(&key).map(|plan| Arc::clone(&plan.policies))
+	}
+
+	pub(crate) fn clear_table_plans(&self) {
+		self.table_plans.lock().unwrap_or_else(|e| e.into_inner()).clear();
+	}
+
+	pub(crate) fn store_table_plan(
+		&self,
+		key: u64,
+		policies: Vec<CachedRatelimitPolicy>,
+	) -> Arc<Vec<CachedRatelimitPolicy>> {
+		let policies = Arc::new(policies);
+		let mut plans = self.table_plans.lock().unwrap_or_else(|e| e.into_inner());
+		plans.insert(
+			key,
+			CachedTableRatelimitPlan {
+				policies: Arc::clone(&policies),
+			},
+		);
+		policies
+	}
+
 	pub(crate) fn admit_local_hash(
 		&self,
 		key_hash: u64,
@@ -143,33 +203,35 @@ impl RateLimiter {
 	}
 
 	fn take_local_lease(&self, key: u64, now_ms: u64) -> bool {
-		let mut leases = self.local_leases.lock().unwrap_or_else(|e| e.into_inner());
-		let Some(lease) = leases.get_mut(&key) else {
-			return false;
-		};
-		if lease.expires_at_ms <= now_ms || lease.tokens == 0 {
-			leases.remove(&key);
+		if self.hot_lease_key.load(Ordering::Relaxed) != key {
 			return false;
 		}
-		lease.tokens -= 1;
-		if lease.tokens == 0 {
-			leases.remove(&key);
+		if self.hot_lease_expires_at_ms.load(Ordering::Relaxed) <= now_ms {
+			self.hot_lease_tokens.store(0, Ordering::Relaxed);
+			return false;
 		}
-		true
+		let mut tokens = self.hot_lease_tokens.load(Ordering::Relaxed);
+		while tokens > 0 {
+			match self.hot_lease_tokens.compare_exchange_weak(
+				tokens,
+				tokens - 1,
+				Ordering::Relaxed,
+				Ordering::Relaxed,
+			) {
+				Ok(_) => return true,
+				Err(current) => tokens = current,
+			}
+		}
+		false
 	}
 
 	fn store_local_lease(&self, key: u64, tokens: u64, expires_at_ms: u64) {
 		if tokens == 0 {
 			return;
 		}
-		let mut leases = self.local_leases.lock().unwrap_or_else(|e| e.into_inner());
-		leases.insert(
-			key,
-			LocalLease {
-				tokens,
-				expires_at_ms,
-			},
-		);
+		self.hot_lease_expires_at_ms.store(expires_at_ms, Ordering::Relaxed);
+		self.hot_lease_tokens.store(tokens, Ordering::Relaxed);
+		self.hot_lease_key.store(key, Ordering::Relaxed);
 	}
 
 	async fn cleanup_expired(&self, txn: &Transaction, now_ms: u64) -> Result<()> {
