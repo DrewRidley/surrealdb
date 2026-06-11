@@ -2613,10 +2613,54 @@ mod tests {
 		.await
 		.unwrap();
 
+		// This SELECT is read-only, but KV-backed admission mutates bucket state.
+		// It must transparently retry in a writable transaction instead of leaking
+		// the internal RateLimitRequiresWrite sentinel to the client.
 		ds.execute("SELECT * FROM person", &sess, None).await.unwrap()[0].result.as_ref().unwrap();
 		let res = ds.execute("SELECT * FROM person", &sess, None).await.unwrap();
 		let err = res[0].result.as_ref().unwrap_err().to_string();
 		assert!(err.contains("rate limit"), "expected rate limit error, got: {err}");
+		assert!(
+			!err.contains("requires a writable transaction"),
+			"internal writable-retry sentinel leaked to client: {err}"
+		);
+	}
+
+	#[tokio::test]
+	async fn inline_table_ratelimit_undefined_create_target_is_not_planning_error() {
+		let ds = Datastore::new("memory").await.unwrap();
+		let sess = Session::owner().with_ns("NS").with_db("DB");
+
+		ds.execute("DEFINE NAMESPACE NS; USE NS NS; DEFINE DATABASE DB;", &sess, None)
+			.await
+			.unwrap();
+
+		let res = ds.execute("CREATE missing_table:1", &sess, None).await.unwrap();
+		res[0].result.as_ref().unwrap();
+	}
+
+	#[tokio::test]
+	async fn inline_table_ratelimit_cached_plan_skips_undefined_create_target() {
+		let ds = Datastore::new("memory").await.unwrap();
+		let sess = Session::owner().with_ns("NS").with_db("DB");
+
+		ds.execute(
+			"DEFINE NAMESPACE NS; USE NS NS; DEFINE DATABASE DB; \
+			 DEFINE TABLE person RATELIMIT FOR CREATE BY $session.id LIMIT 100 PER 1h; \
+			 CREATE person:1;",
+			&sess,
+			None,
+		)
+		.await
+		.unwrap();
+
+		// Warm the cacheable admission plan for `person`. The next statement mixes
+		// that cached table with an undefined create target, which must be skipped
+		// rather than turning normal schemaless CREATE semantics into a catalog error.
+		ds.execute("CREATE person:2", &sess, None).await.unwrap()[0].result.as_ref().unwrap();
+		let res = ds.execute("CREATE person:3, missing_table:1", &sess, None).await.unwrap();
+		let rows = res[0].result.as_ref().unwrap().as_array().unwrap();
+		assert_eq!(rows.len(), 2);
 	}
 
 	#[tokio::test]
