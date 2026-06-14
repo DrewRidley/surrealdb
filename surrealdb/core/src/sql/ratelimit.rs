@@ -14,14 +14,27 @@ pub(crate) struct RateLimit {
 	pub period: PublicDuration,
 	pub burst: Option<u64>,
 	pub scan: Option<u64>,
+	pub scan_period: Option<PublicDuration>,
 	pub result: Option<u64>,
 }
 
 pub(crate) type RateLimits = Vec<RateLimit>;
 
-impl ToSql for RateLimit {
-	fn fmt_sql(&self, f: &mut String, sql_fmt: SqlFormat) {
-		f.push_str("RATELIMIT FOR ");
+impl RateLimit {
+	pub(crate) fn fmt_sql_clause(&self, f: &mut String, sql_fmt: SqlFormat) {
+		f.push_str("FOR ");
+		if self.actions.is_empty() {
+			if let Some(scan) = self.scan {
+				write_sql!(
+					f,
+					sql_fmt,
+					"SCAN {} PER {}",
+					scan,
+					self.scan_period.as_ref().unwrap_or(&self.period)
+				);
+			}
+			return;
+		}
 		for (i, action) in self.actions.iter().enumerate() {
 			if i > 0 {
 				f.push_str(", ");
@@ -38,10 +51,33 @@ impl ToSql for RateLimit {
 		}
 		if let Some(scan) = self.scan {
 			write_sql!(f, sql_fmt, " SCAN {}", scan);
+			if let Some(period) = &self.scan_period {
+				write_sql!(f, sql_fmt, " PER {}", period);
+			}
 		}
 		if let Some(result) = self.result {
 			write_sql!(f, sql_fmt, " RESULT {}", result);
 		}
+	}
+}
+
+impl ToSql for RateLimit {
+	fn fmt_sql(&self, f: &mut String, sql_fmt: SqlFormat) {
+		f.push_str("RATELIMIT ");
+		self.fmt_sql_clause(f, sql_fmt);
+	}
+}
+
+pub(crate) fn fmt_ratelimits_block(f: &mut String, sql_fmt: SqlFormat, ratelimits: &[RateLimit]) {
+	if ratelimits.is_empty() {
+		return;
+	}
+	f.push_str("RATELIMIT ");
+	for (i, ratelimit) in ratelimits.iter().enumerate() {
+		if i > 0 {
+			f.push_str(", ");
+		}
+		ratelimit.fmt_sql_clause(f, sql_fmt);
 	}
 }
 
@@ -55,6 +91,7 @@ impl From<crate::catalog::RateLimit> for RateLimit {
 			period: v.period.into(),
 			burst: v.burst,
 			scan: v.scan,
+			scan_period: v.scan_period.map(PublicDuration::from_std),
 			result: v.result,
 		}
 	}

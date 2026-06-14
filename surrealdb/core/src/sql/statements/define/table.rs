@@ -115,7 +115,7 @@ impl ToSql for DefineTableStatement {
 			f.push(' ');
 		}
 		write_sql!(f, sql_fmt, "{}", self.permissions);
-		for ratelimit in &self.ratelimits {
+		if !self.ratelimits.is_empty() {
 			if sql_fmt.is_pretty() {
 				f.push('\n');
 				let inner_fmt = sql_fmt.increment();
@@ -123,7 +123,7 @@ impl ToSql for DefineTableStatement {
 			} else {
 				f.push(' ');
 			}
-			write_sql!(f, sql_fmt, "{}", ratelimit);
+			crate::sql::ratelimit::fmt_ratelimits_block(f, sql_fmt, &self.ratelimits);
 		}
 	}
 }

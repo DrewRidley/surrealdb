@@ -143,14 +143,14 @@ impl ToSql for DefineFieldStatement {
 			f.push(' ');
 		}
 		self.permissions.fmt_sql(f, sql_fmt);
-		for ratelimit in &self.ratelimits {
+		if !self.ratelimits.is_empty() {
 			if sql_fmt.is_pretty() {
 				f.push('\n');
 				sql_fmt.write_indent(f);
 			} else {
 				f.push(' ');
 			}
-			write_sql!(f, sql_fmt, "{}", ratelimit);
+			crate::sql::ratelimit::fmt_ratelimits_block(f, sql_fmt, &self.ratelimits);
 		}
 	}
 }

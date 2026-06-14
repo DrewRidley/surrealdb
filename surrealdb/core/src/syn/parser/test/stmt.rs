@@ -3115,6 +3115,34 @@ fn parse_define_table_ratelimit() {
 }
 
 #[test]
+fn parse_define_table_ratelimit_grouped_clauses() {
+	let res = syn::parse_with(
+		r#"DEFINE TABLE knows RATELIMIT FOR SELECT BY $auth.id LIMIT 100 PER 1m, FOR UPDATE BY $auth.id LIMIT 100 PER 1h, FOR SCAN 10000 PER 1h"#.as_bytes(),
+		async |parser, stk| parser.parse_expr_inherit(stk).await,
+	)
+	.unwrap();
+
+	match res {
+		Expr::Define(stmt) => match *stmt {
+			DefineStatement::Table(stmt) => {
+				assert_eq!(stmt.ratelimits.len(), 3);
+				assert_eq!(stmt.ratelimits[0].actions, vec![PermissionKind::Select]);
+				assert_eq!(stmt.ratelimits[0].limit, 100);
+				assert_eq!(stmt.ratelimits[0].period, PublicDuration::from_secs(60));
+				assert_eq!(stmt.ratelimits[1].actions, vec![PermissionKind::Update]);
+				assert_eq!(stmt.ratelimits[1].limit, 100);
+				assert_eq!(stmt.ratelimits[1].period, PublicDuration::from_secs(3600));
+				assert!(stmt.ratelimits[2].actions.is_empty());
+				assert_eq!(stmt.ratelimits[2].scan, Some(10000));
+				assert_eq!(stmt.ratelimits[2].scan_period, Some(PublicDuration::from_secs(3600)));
+			}
+			_ => panic!("expected table definition"),
+		},
+		_ => panic!("expected define statement"),
+	}
+}
+
+#[test]
 fn parse_define_field_ratelimit_rejects_delete() {
 	let err = syn::parse_with(
 		r#"DEFINE FIELD name ON post RATELIMIT FOR DELETE BY $auth.id LIMIT 1 PER 1s"#.as_bytes(),

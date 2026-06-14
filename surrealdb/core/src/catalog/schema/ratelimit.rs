@@ -9,7 +9,7 @@ use crate::expr::statements::info::InfoStructure;
 use crate::types::PublicDuration;
 use crate::val::Value;
 
-#[revisioned(revision = 1)]
+#[revisioned(revision = 2)]
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct RateLimit {
 	pub(crate) actions: Vec<PermissionKind>,
@@ -19,6 +19,8 @@ pub struct RateLimit {
 	pub(crate) period: Duration,
 	pub(crate) burst: Option<u64>,
 	pub(crate) scan: Option<u64>,
+	#[revision(start = 2)]
+	pub(crate) scan_period: Option<Duration>,
 	pub(crate) result: Option<u64>,
 }
 
@@ -34,6 +36,7 @@ impl RateLimit {
 			period: PublicDuration::from_std(self.period),
 			burst: self.burst,
 			scan: self.scan,
+			scan_period: self.scan_period.map(PublicDuration::from_std),
 			result: self.result,
 		}
 	}
@@ -55,6 +58,7 @@ impl InfoStructure for RateLimit {
 			"period" => Value::Duration(self.period.into()),
 			"burst", if let Some(v) = self.burst => v.into(),
 			"scan", if let Some(v) = self.scan => v.into(),
+			"scan_period", if let Some(v) = self.scan_period => Value::Duration(v.into()),
 			"result", if let Some(v) = self.result => v.into(),
 		})
 	}
@@ -70,6 +74,7 @@ impl From<crate::sql::RateLimit> for RateLimit {
 			period: v.period.into_inner(),
 			burst: v.burst,
 			scan: v.scan,
+			scan_period: v.scan_period.map(|v| v.into_inner()),
 			result: v.result,
 		}
 	}

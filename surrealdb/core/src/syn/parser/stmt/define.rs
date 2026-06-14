@@ -49,7 +49,43 @@ impl Parser<'_> {
 		stk: &mut Stk,
 		allow_delete: bool,
 	) -> ParseResult<Vec<RateLimit>> {
+		let mut ratelimits = Vec::new();
 		expected!(self, t!("FOR"));
+		loop {
+			ratelimits.push(stk.run(|stk| self.parse_ratelimit_clause(stk, allow_delete)).await?);
+			self.eat(t!(","));
+			if !self.eat(t!("FOR")) {
+				break;
+			}
+		}
+		Ok(ratelimits)
+	}
+
+	async fn parse_ratelimit_clause(
+		&mut self,
+		stk: &mut Stk,
+		allow_delete: bool,
+	) -> ParseResult<RateLimit> {
+		if self.eat(t!("SCAN")) {
+			if !allow_delete {
+				bail!("Can't define rate limit SCAN for fields", @self.last_span());
+			}
+			let scan = self.next_token_value::<u64>()?;
+			expected!(self, t!("PER"));
+			let period = self.next_token_value::<PublicDuration>()?;
+			return Ok(RateLimit {
+				actions: Vec::new(),
+				condition: None,
+				bucket: Expr::Literal(Literal::None),
+				limit: scan,
+				period: period.clone(),
+				burst: None,
+				scan: Some(scan),
+				scan_period: Some(period),
+				result: None,
+			});
+		}
+
 		let mut actions = Vec::new();
 		loop {
 			let token = self.next();
@@ -59,7 +95,11 @@ impl Parser<'_> {
 				t!("UPDATE") => PermissionKind::Update,
 				t!("DELETE") if allow_delete => PermissionKind::Delete,
 				t!("DELETE") => unexpected!(self, token, "one of `SELECT`, `CREATE` or `UPDATE`"),
-				_ => unexpected!(self, token, "one of `SELECT`, `CREATE`, `UPDATE` or `DELETE`"),
+				_ => unexpected!(
+					self,
+					token,
+					"one of `SELECT`, `CREATE`, `UPDATE`, `DELETE` or `SCAN`"
+				),
 			};
 			actions.push(action);
 			if !self.eat(t!(",")) {
@@ -86,10 +126,16 @@ impl Parser<'_> {
 		} else {
 			None
 		};
-		let scan = if self.eat(t!("SCAN")) {
-			Some(self.next_token_value::<u64>()?)
+		let (scan, scan_period) = if self.eat(t!("SCAN")) {
+			let scan = self.next_token_value::<u64>()?;
+			let period = if self.eat(t!("PER")) {
+				Some(self.next_token_value::<PublicDuration>()?)
+			} else {
+				None
+			};
+			(Some(scan), period)
 		} else {
-			None
+			(None, None)
 		};
 		let result = if self.eat(t!("RESULT")) {
 			Some(self.next_token_value::<u64>()?)
@@ -97,7 +143,7 @@ impl Parser<'_> {
 			None
 		};
 
-		Ok(vec![RateLimit {
+		Ok(RateLimit {
 			actions,
 			condition,
 			bucket,
@@ -105,8 +151,9 @@ impl Parser<'_> {
 			period,
 			burst,
 			scan,
+			scan_period,
 			result,
-		}])
+		})
 	}
 
 	pub(crate) async fn parse_define_stmt(

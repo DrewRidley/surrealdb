@@ -67,6 +67,14 @@ struct PreparedBroker {
 	delivery: Arc<dyn MessageBroker>,
 }
 
+#[derive(Clone, Debug)]
+struct ScanReservation {
+	key_hash: u64,
+	limit: u64,
+	period: Duration,
+	reserved: u64,
+}
+
 /// An executor which relies on the `compute` methods of the logical expressions.
 pub struct Executor {
 	stack: TreeStack,
@@ -80,6 +88,7 @@ pub struct Executor {
 	/// broker was already present (higher layer) or this statement skipped installation.
 	/// Drives conditional [`clear_broker`] so we never remove an externally supplied broker.
 	broker_owned_by_executor: bool,
+	scan_reservations: Vec<ScanReservation>,
 }
 
 impl Executor {
@@ -178,8 +187,32 @@ impl Executor {
 		}
 	}
 
+	async fn reserve_scan_quota(
+		&mut self,
+		kvs: &Datastore,
+		key_hash: u64,
+		limit: u64,
+		period: Duration,
+	) -> FlowResult<u64> {
+		let txn = kvs
+			.transaction(TransactionType::Write, LockType::Optimistic)
+			.await?
+			.with_tenant_identity(self.ctx.tenant_identity().cloned());
+		let reserved =
+			self.ctx.rate_limiter().reserve_kv_hash(&txn, key_hash, limit, period, limit).await?;
+		txn.commit().await?;
+		self.scan_reservations.push(ScanReservation {
+			key_hash,
+			limit,
+			period,
+			reserved,
+		});
+		Ok(reserved)
+	}
+
 	async fn admit_cached_table_ratelimit_policy(
 		&mut self,
+		kvs: &Datastore,
 		txn: &Transaction,
 		table_name: &str,
 		policy: &CachedRatelimitPolicy,
@@ -187,32 +220,44 @@ impl Executor {
 		result: &mut Option<u64>,
 	) -> FlowResult<()> {
 		let mut key = StableHasher::from_hash(policy.key_seed);
-		self.hash_fast_session_ratelimit_bucket(policy.bucket, &mut key);
+		let mut scan_key = StableHasher::from_hash(policy.scan_key_seed);
+		if let Some(bucket) = policy.bucket {
+			self.hash_fast_session_ratelimit_bucket(bucket, &mut key);
+			self.hash_fast_session_ratelimit_bucket(bucket, &mut scan_key);
+		}
 		let key = key.finish();
+		let scan_key = scan_key.finish();
 
-		let locally_admitted = self.ctx.rate_limiter().admit_local_hash(
-			key,
-			policy.limit,
-			policy.period,
-			policy.burst,
-		);
-		if !locally_admitted {
-			if !txn.writeable() {
-				return Err(ControlFlow::Err(anyhow::Error::new(RateLimitRequiresWrite)));
-			}
-			if !self
-				.ctx
-				.rate_limiter()
-				.admit_kv_hash(txn, key, policy.limit, policy.period, policy.burst)
-				.await?
-			{
-				return Err(ControlFlow::Err(anyhow::Error::new(Error::RateLimitExceeded {
-					scope: format!("table {table_name}"),
-				})));
+		if policy.bucket.is_some() {
+			let locally_admitted = self.ctx.rate_limiter().admit_local_hash(
+				key,
+				policy.limit,
+				policy.period,
+				policy.burst,
+			);
+			if !locally_admitted {
+				if !txn.writeable() {
+					return Err(ControlFlow::Err(anyhow::Error::new(RateLimitRequiresWrite)));
+				}
+				if !self
+					.ctx
+					.rate_limiter()
+					.admit_kv_hash(txn, key, policy.limit, policy.period, policy.burst)
+					.await?
+				{
+					return Err(ControlFlow::Err(anyhow::Error::new(Error::RateLimitExceeded {
+						scope: format!("table {table_name}"),
+					})));
+				}
 			}
 		}
 
 		if let Some(limit) = policy.scan {
+			let limit = if let Some(period) = policy.scan_period {
+				self.reserve_scan_quota(kvs, scan_key, limit, period).await?
+			} else {
+				limit
+			};
 			Self::merge_limit(scan, limit);
 		}
 		if let Some(limit) = policy.result {
@@ -223,6 +268,7 @@ impl Executor {
 
 	async fn inline_ratelimit_resource_limits(
 		&mut self,
+		kvs: &Datastore,
 		txn: Arc<Transaction>,
 		table_ratelimit_targets: Option<&TableRatelimitTargets>,
 	) -> FlowResult<Option<ResourceLimits>> {
@@ -230,6 +276,7 @@ impl Executor {
 			return Ok(None);
 		};
 
+		self.scan_reservations.clear();
 		let mut scan = None;
 		let mut result = None;
 
@@ -246,6 +293,7 @@ impl Executor {
 			if let Some(cached) = self.ctx.rate_limiter().cached_table_plan_by_key(plan_key) {
 				for policy in cached.iter() {
 					self.admit_cached_table_ratelimit_policy(
+						kvs,
 						&txn,
 						&table_name,
 						policy,
@@ -265,6 +313,37 @@ impl Executor {
 			let mut cacheable = true;
 			let mut cached_policies = Vec::new();
 			for (policy_index, policy) in table.ratelimits.iter().enumerate() {
+				if policy.actions.is_empty() {
+					let mut scan_key_seed = StableHasher::new();
+					self.opt.ns()?.hash(&mut scan_key_seed);
+					self.opt.db()?.hash(&mut scan_key_seed);
+					table_name.hash(&mut scan_key_seed);
+					"scan".hash(&mut scan_key_seed);
+					policy_index.hash(&mut scan_key_seed);
+					let scan_key_seed = scan_key_seed.finish();
+					let cached = CachedRatelimitPolicy {
+						bucket: None,
+						key_seed: scan_key_seed,
+						scan_key_seed,
+						limit: policy.limit,
+						period: policy.period,
+						burst: policy.burst,
+						scan: policy.scan,
+						scan_period: policy.scan_period,
+						result: policy.result,
+					};
+					self.admit_cached_table_ratelimit_policy(
+						kvs,
+						&txn,
+						&table_name,
+						&cached,
+						&mut scan,
+						&mut result,
+					)
+					.await?;
+					cached_policies.push(cached);
+					continue;
+				}
 				if !policy.actions.contains(action) {
 					continue;
 				}
@@ -287,13 +366,18 @@ impl Executor {
 					Self::fast_ratelimit_bucket(&policy.bucket).map(|bucket| {
 						let mut key_seed = StableHasher::from_hash(key_seed.finish());
 						policy_index.hash(&mut key_seed);
+						let key_seed = key_seed.finish();
+						let mut scan_key_seed = StableHasher::from_hash(key_seed);
+						"scan".hash(&mut scan_key_seed);
 						CachedRatelimitPolicy {
-							bucket,
-							key_seed: key_seed.finish(),
+							bucket: Some(bucket),
+							key_seed,
+							scan_key_seed: scan_key_seed.finish(),
 							limit: policy.limit,
 							period: policy.period,
 							burst: policy.burst,
 							scan: policy.scan,
+							scan_period: policy.scan_period,
 							result: policy.result,
 						}
 					})
@@ -302,6 +386,7 @@ impl Executor {
 				};
 				if let Some(cached) = cached {
 					self.admit_cached_table_ratelimit_policy(
+						kvs,
 						&txn,
 						&table_name,
 						&cached,
@@ -328,6 +413,9 @@ impl Executor {
 					.await?;
 				bucket.hash(&mut key);
 				let key = key.finish();
+				let mut scan_key = StableHasher::from_hash(key);
+				"scan".hash(&mut scan_key);
+				let scan_key = scan_key.finish();
 				let locally_admitted = self.ctx.rate_limiter().admit_local_hash(
 					key,
 					policy.limit,
@@ -353,6 +441,11 @@ impl Executor {
 				}
 
 				if let Some(limit) = policy.scan {
+					let limit = if let Some(period) = policy.scan_period {
+						self.reserve_scan_quota(kvs, scan_key, limit, period).await?
+					} else {
+						limit
+					};
 					Self::merge_limit(&mut scan, limit);
 				}
 				if let Some(limit) = policy.result {
@@ -381,6 +474,7 @@ impl Executor {
 
 	async fn install_inline_ratelimit_budget(
 		&mut self,
+		kvs: &Datastore,
 		txn: Arc<Transaction>,
 		plan: &TopLevelExpr,
 		table_ratelimit_targets: Option<&TableRatelimitTargets>,
@@ -393,7 +487,7 @@ impl Executor {
 		ctx.set_transaction(Arc::clone(&txn));
 
 		let budget = self
-			.inline_ratelimit_resource_limits(txn, table_ratelimit_targets)
+			.inline_ratelimit_resource_limits(kvs, txn, table_ratelimit_targets)
 			.await?
 			.map(ResourceBudget::enforcing)
 			.map(Arc::new);
@@ -427,6 +521,47 @@ impl Executor {
 	fn set_partial_truncation_allowed(&self, allowed: bool) {
 		if let Some(budget) = self.ctx.resource_budget() {
 			budget.set_truncation_allowed(allowed);
+		}
+	}
+
+	async fn refund_unused_scan_reservations(&mut self, kvs: &Datastore) {
+		let scanned = self
+			.ctx
+			.resource_budget()
+			.map(|budget| budget.usage().get(GovResourceKind::ScanKey))
+			.unwrap_or_default();
+		let reservations = std::mem::take(&mut self.scan_reservations);
+		for reservation in reservations {
+			let used = reservation.reserved.min(scanned);
+			let refund = reservation.reserved.saturating_sub(used);
+			if refund == 0 {
+				continue;
+			}
+			let txn = match kvs.transaction(TransactionType::Write, LockType::Optimistic).await {
+				Ok(txn) => txn.with_tenant_identity(self.ctx.tenant_identity().cloned()),
+				Err(error) => {
+					tracing::warn!(target: TARGET, %error, "failed to create scan quota refund transaction");
+					continue;
+				}
+			};
+			let refund_result = self
+				.ctx
+				.rate_limiter()
+				.refund_kv_hash(
+					&txn,
+					reservation.key_hash,
+					reservation.limit,
+					reservation.period,
+					refund,
+				)
+				.await;
+			let refund_result = match refund_result {
+				Ok(()) => txn.commit().await,
+				Err(error) => Err(error),
+			};
+			if let Err(error) = refund_result {
+				tracing::warn!(target: TARGET, %error, "failed to refund unused scan quota");
+			}
 		}
 	}
 
@@ -511,6 +646,7 @@ impl Executor {
 			ctx,
 			cached_session: None,
 			broker_owned_by_executor: false,
+			scan_reservations: Vec::new(),
 		}
 	}
 
@@ -1014,13 +1150,19 @@ impl Executor {
 	#[instrument(level = "debug", name = "executor", target = "surrealdb::core::dbs", skip_all)]
 	async fn execute_plan_in_transaction(
 		&mut self,
+		kvs: &Datastore,
 		txn: Arc<Transaction>,
 		start: &Instant,
 		plan: TopLevelExpr,
 		table_ratelimit_targets: Option<&TableRatelimitTargets>,
 	) -> FlowResult<Value> {
-		self.install_inline_ratelimit_budget(Arc::clone(&txn), &plan, table_ratelimit_targets)
-			.await?;
+		if let Err(error) = self
+			.install_inline_ratelimit_budget(kvs, Arc::clone(&txn), &plan, table_ratelimit_targets)
+			.await
+		{
+			self.refund_unused_scan_reservations(kvs).await;
+			return Err(error);
+		}
 
 		/// Helper method to get mutable access to the context
 		macro_rules! ctx_mut {
@@ -1280,7 +1422,7 @@ impl Executor {
 						)
 					})
 					.map_err(anyhow::Error::new)?
-					.set_transaction(txn);
+					.set_transaction(Arc::clone(&txn));
 				self.stack
 					.enter(|stk| s.compute(stk, &self.ctx, &self.opt, None))
 					.finish()
@@ -1288,7 +1430,7 @@ impl Executor {
 					.map_err(ControlFlow::Err)
 			}
 			TopLevelExpr::Live(s) => {
-				ctx_mut!().set_transaction(txn);
+				ctx_mut!().set_transaction(Arc::clone(&txn));
 				self.stack
 					.enter(|stk| s.compute(stk, &self.ctx, &self.opt, None))
 					.finish()
@@ -1296,11 +1438,11 @@ impl Executor {
 					.map_err(ControlFlow::Err)
 			}
 			TopLevelExpr::Show(s) => {
-				ctx_mut!().set_transaction(txn);
+				ctx_mut!().set_transaction(Arc::clone(&txn));
 				s.compute(&self.ctx, &self.opt, None).await.map_err(ControlFlow::Err)
 			}
 			TopLevelExpr::Access(s) => {
-				ctx_mut!().set_transaction(txn);
+				ctx_mut!().set_transaction(Arc::clone(&txn));
 				self.stack.enter(|stk| s.compute(stk, &self.ctx, &self.opt, None)).finish().await
 			}
 			// Process all other normal statements
@@ -1329,7 +1471,7 @@ impl Executor {
 							tracing::warn!("PlannerUnimplemented fallback in executor: {msg}");
 						}
 						// Fallback to existing compute path
-						ctx_mut!().set_transaction(txn);
+						ctx_mut!().set_transaction(Arc::clone(&txn));
 						let res = self
 							.stack
 							.enter(|stk| e.compute(stk, &self.ctx, &self.opt, None))
@@ -1344,15 +1486,18 @@ impl Executor {
 		};
 
 		// Catch cancellation during running.
-		match self.ctx.done(true)? {
-			None => res,
-			Some(Reason::Timedout(d)) => {
+		let res = match self.ctx.done(true) {
+			Ok(None) => res,
+			Ok(Some(Reason::Timedout(d))) => {
 				Err(ControlFlow::from(anyhow::anyhow!(Error::QueryTimedout(d))))
 			}
-			Some(Reason::Canceled) => {
+			Ok(Some(Reason::Canceled)) => {
 				Err(ControlFlow::from(anyhow::anyhow!(Error::QueryCancelled)))
 			}
-		}
+			Err(error) => Err(ControlFlow::from(error)),
+		};
+		self.refund_unused_scan_reservations(kvs).await;
+		res
 	}
 
 	/// Execute a query not wrapped in a transaction block.
@@ -1421,6 +1566,7 @@ impl Executor {
 				match tokio::time::timeout(
 					timeout,
 					self.execute_plan_in_transaction(
+						kvs,
 						Arc::clone(&txn),
 						start,
 						plan,
@@ -1432,12 +1578,14 @@ impl Executor {
 					Ok(res) => res,
 					Err(_) => {
 						let _ = txn.cancel().await;
+						self.refund_unused_scan_reservations(kvs).await;
 						bail!(Error::TransactionTimedout(timeout.into()))
 					}
 				}
 			}
 			None => {
 				self.execute_plan_in_transaction(
+					kvs,
 					Arc::clone(&txn),
 					start,
 					plan,
@@ -1956,6 +2104,7 @@ impl Executor {
 					self.set_partial_truncation_allowed(statement_read_only);
 					let execution = self
 						.execute_plan_in_transaction(
+							kvs,
 							Arc::clone(&txn),
 							&before,
 							plan,
@@ -2156,6 +2305,7 @@ impl Executor {
 			executor.set_partial_truncation_allowed(statement_read_only);
 			let result = executor
 				.execute_plan_in_transaction(
+					kvs,
 					Arc::clone(&tx),
 					&start,
 					expr,
@@ -2817,6 +2967,93 @@ mod tests {
 		let rows = res[0].result.as_ref().unwrap().as_array().unwrap();
 		assert_eq!(rows.len(), 2);
 		assert_eq!(res[0].partial, Some(PartialReason::ScanLimit));
+	}
+
+	#[tokio::test]
+	async fn inline_table_ratelimit_grouped_scan_budget_is_cumulative_per_period() {
+		let ds = Datastore::new("memory").await.unwrap();
+		let sess = Session::owner().with_ns("NS").with_db("DB");
+
+		ds.execute(
+			"DEFINE NAMESPACE NS; USE NS NS; DEFINE DATABASE DB; \
+			 DEFINE TABLE person; \
+			 CREATE person:1; CREATE person:2; CREATE person:3; \
+			 DEFINE TABLE OVERWRITE person RATELIMIT FOR SELECT BY $session.id LIMIT 100 PER 1s, FOR SCAN 2 PER 1h;",
+			&sess,
+			None,
+		)
+		.await
+		.unwrap();
+
+		let res = ds.execute("SELECT * FROM person", &sess, None).await.unwrap();
+		let rows = res[0].result.as_ref().unwrap().as_array().unwrap();
+		assert_eq!(rows.len(), 2);
+		assert_eq!(res[0].partial, Some(PartialReason::ScanLimit));
+
+		let res = ds.execute("SELECT * FROM person", &sess, None).await.unwrap();
+		let rows = res[0].result.as_ref().unwrap().as_array().unwrap();
+		assert_eq!(rows.len(), 0);
+		assert_eq!(res[0].partial, Some(PartialReason::ScanLimit));
+	}
+
+	#[tokio::test]
+	async fn inline_table_ratelimit_overlapping_scan_quotas_charge_each_policy() {
+		let ds = Datastore::new("memory").await.unwrap();
+		let sess_a = Session::owner().with_ns("NS").with_db("DB").with_ac("A");
+		let sess_b = Session::owner().with_ns("NS").with_db("DB").with_ac("B");
+
+		ds.execute(
+			"DEFINE NAMESPACE NS; USE NS NS; DEFINE DATABASE DB; \
+			 DEFINE TABLE person; \
+			 CREATE person:1; CREATE person:2; CREATE person:3; \
+			 DEFINE TABLE OVERWRITE person RATELIMIT \
+				FOR SELECT BY $session.ac LIMIT 100 PER 1s SCAN 2 PER 1h, \
+				FOR SCAN 2 PER 1h;",
+			&sess_a,
+			None,
+		)
+		.await
+		.unwrap();
+
+		let res = ds.execute("SELECT * FROM person", &sess_a, None).await.unwrap();
+		let rows = res[0].result.as_ref().unwrap().as_array().unwrap();
+		assert_eq!(rows.len(), 2);
+		assert_eq!(res[0].partial, Some(PartialReason::ScanLimit));
+
+		let res = ds.execute("SELECT * FROM person", &sess_b, None).await.unwrap();
+		let rows = res[0].result.as_ref().unwrap().as_array().unwrap();
+		assert_eq!(rows.len(), 0);
+		assert_eq!(res[0].partial, Some(PartialReason::ScanLimit));
+	}
+
+	#[tokio::test]
+	async fn inline_table_ratelimit_failed_mutation_still_consumes_scan_quota() {
+		let ds = Datastore::new("memory").await.unwrap();
+		let sess = Session::owner().with_ns("NS").with_db("DB");
+
+		ds.execute(
+			"DEFINE NAMESPACE NS; USE NS NS; DEFINE DATABASE DB; \
+			 DEFINE TABLE person SCHEMAFULL; \
+			 DEFINE FIELD age ON person TYPE int ASSERT $value > 0; \
+			 CREATE person:1 SET age = 1; CREATE person:2 SET age = 2; \
+			 DEFINE TABLE OVERWRITE person SCHEMAFULL RATELIMIT FOR SCAN 1 PER 1h; \
+			 DEFINE FIELD OVERWRITE age ON person TYPE int ASSERT $value > 0;",
+			&sess,
+			None,
+		)
+		.await
+		.unwrap();
+
+		let res = ds.execute("UPDATE person SET age = -1", &sess, None).await.unwrap();
+		let err = res[0].result.as_ref().unwrap_err().to_string();
+		assert!(err.contains("field must conform"), "expected assertion error, got: {err}");
+
+		let res = ds.execute("UPDATE person SET age = -1", &sess, None).await.unwrap();
+		let err = res[0].result.as_ref().unwrap_err().to_string();
+		assert!(
+			err.contains("scan keys resource budget"),
+			"expected consumed scan quota to reject the second mutation, got: {err}"
+		);
 	}
 
 	#[tokio::test]

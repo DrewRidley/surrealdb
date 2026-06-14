@@ -32,12 +32,14 @@ pub(crate) enum FastRatelimitBucket {
 
 #[derive(Clone, Debug)]
 pub(crate) struct CachedRatelimitPolicy {
-	pub(crate) bucket: FastRatelimitBucket,
+	pub(crate) bucket: Option<FastRatelimitBucket>,
 	pub(crate) key_seed: u64,
+	pub(crate) scan_key_seed: u64,
 	pub(crate) limit: u64,
 	pub(crate) period: Duration,
 	pub(crate) burst: Option<u64>,
 	pub(crate) scan: Option<u64>,
+	pub(crate) scan_period: Option<Duration>,
 	pub(crate) result: Option<u64>,
 }
 
@@ -134,6 +136,28 @@ impl RateLimiter {
 		self.admit_kv_inner(txn, key_hash, limit, period, burst).await
 	}
 
+	pub(crate) async fn reserve_kv_hash(
+		&self,
+		txn: &Transaction,
+		key_hash: u64,
+		limit: u64,
+		period: Duration,
+		amount: u64,
+	) -> Result<u64> {
+		self.reserve_kv_inner(txn, key_hash, limit, period, amount).await
+	}
+
+	pub(crate) async fn refund_kv_hash(
+		&self,
+		txn: &Transaction,
+		key_hash: u64,
+		limit: u64,
+		period: Duration,
+		amount: u64,
+	) -> Result<()> {
+		self.refund_kv_inner(txn, key_hash, limit, period, amount).await
+	}
+
 	pub(crate) async fn admit_kv(
 		&self,
 		txn: &Transaction,
@@ -167,20 +191,9 @@ impl RateLimiter {
 		let reservation = reservation_size(limit, capacity_u64);
 		let key = kv_key(key_hash);
 		let old = txn.get(&key, None).await?;
-		let mut bucket = old
-			.as_deref()
-			.and_then(decode_bucket)
-			.filter(|bucket| bucket.expires_at_ms > now_ms)
-			.unwrap_or(StoredBucket {
-				tokens: capacity,
-				last_ms: now_ms,
-				expires_at_ms: expiry_millis(now_ms, period, capacity, refill_per_second),
-			});
+		let mut bucket = load_bucket(old.as_deref(), now_ms, period, capacity, refill_per_second);
 
-		let elapsed = now_ms.saturating_sub(bucket.last_ms) as f64 / 1000.0;
-		bucket.tokens = (bucket.tokens + elapsed * refill_per_second).min(capacity);
-		bucket.last_ms = now_ms;
-		bucket.expires_at_ms = expiry_millis(now_ms, period, capacity, refill_per_second);
+		refill_bucket(&mut bucket, now_ms, period, capacity, refill_per_second);
 		if bucket.tokens < 1.0 {
 			let new = encode_bucket(&bucket);
 			if !put_bucket(txn, &key, &new, old.as_ref()).await? {
@@ -200,6 +213,67 @@ impl RateLimiter {
 		}
 		self.cleanup_expired(txn, now_ms).await?;
 		Ok(true)
+	}
+
+	async fn reserve_kv_inner(
+		&self,
+		txn: &Transaction,
+		key_hash: u64,
+		limit: u64,
+		period: Duration,
+		amount: u64,
+	) -> Result<u64> {
+		if limit == 0 || amount == 0 {
+			return Ok(0);
+		}
+		let capacity = limit.max(1) as f64;
+		let refill_per_second = limit as f64 / period.as_secs_f64().max(f64::EPSILON);
+		let now_ms = now_millis();
+		let key = kv_key(key_hash);
+		let old = txn.get(&key, None).await?;
+		let mut bucket = load_bucket(old.as_deref(), now_ms, period, capacity, refill_per_second);
+		refill_bucket(&mut bucket, now_ms, period, capacity, refill_per_second);
+
+		let granted = amount.min(bucket.tokens.floor() as u64);
+		if granted == 0 {
+			let new = encode_bucket(&bucket);
+			if !put_bucket(txn, &key, &new, old.as_ref()).await? {
+				return Ok(0);
+			}
+			self.cleanup_expired(txn, now_ms).await?;
+			return Ok(0);
+		}
+		bucket.tokens -= granted as f64;
+		let new = encode_bucket(&bucket);
+		if !put_bucket(txn, &key, &new, old.as_ref()).await? {
+			return Ok(0);
+		}
+		self.cleanup_expired(txn, now_ms).await?;
+		Ok(granted)
+	}
+
+	async fn refund_kv_inner(
+		&self,
+		txn: &Transaction,
+		key_hash: u64,
+		limit: u64,
+		period: Duration,
+		amount: u64,
+	) -> Result<()> {
+		if limit == 0 || amount == 0 {
+			return Ok(());
+		}
+		let capacity = limit.max(1) as f64;
+		let refill_per_second = limit as f64 / period.as_secs_f64().max(f64::EPSILON);
+		let now_ms = now_millis();
+		let key = kv_key(key_hash);
+		let old = txn.get(&key, None).await?;
+		let mut bucket = load_bucket(old.as_deref(), now_ms, period, capacity, refill_per_second);
+		refill_bucket(&mut bucket, now_ms, period, capacity, refill_per_second);
+		bucket.tokens = (bucket.tokens + amount as f64).min(capacity);
+		let new = encode_bucket(&bucket);
+		let _ = put_bucket(txn, &key, &new, old.as_ref()).await?;
+		Ok(())
 	}
 
 	fn take_local_lease(&self, key: u64, now_ms: u64) -> bool {
@@ -280,6 +354,35 @@ fn kv_key(key_hash: u64) -> Vec<u8> {
 	let mut out = RATE_LIMIT_PREFIX.to_vec();
 	out.extend_from_slice(&key_hash.to_be_bytes());
 	out
+}
+
+fn load_bucket(
+	old: Option<&[u8]>,
+	now_ms: u64,
+	period: Duration,
+	capacity: f64,
+	refill_per_second: f64,
+) -> StoredBucket {
+	old.and_then(decode_bucket).filter(|bucket| bucket.expires_at_ms > now_ms).unwrap_or(
+		StoredBucket {
+			tokens: capacity,
+			last_ms: now_ms,
+			expires_at_ms: expiry_millis(now_ms, period, capacity, refill_per_second),
+		},
+	)
+}
+
+fn refill_bucket(
+	bucket: &mut StoredBucket,
+	now_ms: u64,
+	period: Duration,
+	capacity: f64,
+	refill_per_second: f64,
+) {
+	let elapsed = now_ms.saturating_sub(bucket.last_ms) as f64 / 1000.0;
+	bucket.tokens = (bucket.tokens + elapsed * refill_per_second).min(capacity);
+	bucket.last_ms = now_ms;
+	bucket.expires_at_ms = expiry_millis(now_ms, period, capacity, refill_per_second);
 }
 
 fn reservation_size(limit: u64, capacity: u64) -> u64 {
