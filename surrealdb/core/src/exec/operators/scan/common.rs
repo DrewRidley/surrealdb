@@ -303,9 +303,8 @@ pub(crate) async fn fetch_and_filter_records_batch(
 mod tests {
 	use std::sync::Arc;
 
-	use crate::gov::{ChargeOutcome, ResourceBudget, ResourceKind, ResourceLimits};
-
 	use super::charge_scanned_batch;
+	use crate::gov::{ChargeOutcome, ResourceBudget, ResourceKind, ResourceLimits};
 
 	#[test]
 	fn charge_scanned_batch_accounts_scan_and_row_reads() {

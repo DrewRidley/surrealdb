@@ -47,6 +47,7 @@ impl Permissions {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub enum PermissionKind {
 	Select,
 	Create,

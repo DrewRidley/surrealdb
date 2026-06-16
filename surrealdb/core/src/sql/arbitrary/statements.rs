@@ -282,6 +282,7 @@ impl<'a> arbitrary::Arbitrary<'a> for DefineFieldStatement {
 			computed: u.arbitrary()?,
 			default: u.arbitrary()?,
 			permissions,
+			ratelimits: u.arbitrary()?,
 			comment: u.arbitrary()?,
 			reference: u.arbitrary()?,
 			graphql_alias: u.arbitrary()?,

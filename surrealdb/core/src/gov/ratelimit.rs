@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 use std::hash::Hasher;
-use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use web_time::{Duration, SystemTime, UNIX_EPOCH};
@@ -12,10 +11,15 @@ use crate::kvs::{Error as KvsError, Transaction};
 #[derive(Debug, Default)]
 pub(crate) struct RateLimiter {
 	cleanup_counter: AtomicU64,
-	hot_lease_key: AtomicU64,
-	hot_lease_tokens: AtomicU64,
-	hot_lease_expires_at_ms: AtomicU64,
+	hot_lease: Mutex<Option<LocalLease>>,
 	table_plans: Mutex<HashMap<u64, CachedTableRatelimitPlan>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LocalLease {
+	key: u64,
+	tokens: u64,
+	expires_at_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -37,7 +41,6 @@ pub(crate) struct CachedRatelimitPolicy {
 	pub(crate) scan_key_seed: u64,
 	pub(crate) limit: u64,
 	pub(crate) period: Duration,
-	pub(crate) burst: Option<u64>,
 	pub(crate) scan: Option<u64>,
 	pub(crate) scan_period: Option<Duration>,
 	pub(crate) result: Option<u64>,
@@ -112,17 +115,11 @@ impl RateLimiter {
 		policies
 	}
 
-	pub(crate) fn admit_local_hash(
-		&self,
-		key_hash: u64,
-		limit: u64,
-		period: Duration,
-		burst: Option<u64>,
-	) -> bool {
+	pub(crate) fn admit_local_hash(&self, key_hash: u64, limit: u64, period: Duration) -> bool {
 		if limit == 0 {
 			return false;
 		}
-		self.take_local_lease(local_cache_key(key_hash, limit, period, burst), now_millis())
+		self.take_local_lease(local_cache_key(key_hash, limit, period), now_millis())
 	}
 
 	pub(crate) async fn admit_kv_hash(
@@ -131,9 +128,8 @@ impl RateLimiter {
 		key_hash: u64,
 		limit: u64,
 		period: Duration,
-		burst: Option<u64>,
 	) -> Result<bool> {
-		self.admit_kv_inner(txn, key_hash, limit, period, burst).await
+		self.admit_kv_inner(txn, key_hash, limit, period).await
 	}
 
 	pub(crate) async fn reserve_kv_hash(
@@ -164,9 +160,8 @@ impl RateLimiter {
 		key: String,
 		limit: u64,
 		period: Duration,
-		burst: Option<u64>,
 	) -> Result<bool> {
-		self.admit_kv_inner(txn, stable_hash(key.as_bytes()), limit, period, burst).await
+		self.admit_kv_inner(txn, stable_hash(key.as_bytes()), limit, period).await
 	}
 
 	async fn admit_kv_inner(
@@ -175,16 +170,15 @@ impl RateLimiter {
 		key_hash: u64,
 		limit: u64,
 		period: Duration,
-		burst: Option<u64>,
 	) -> Result<bool> {
 		if limit == 0 {
 			return Ok(false);
 		}
-		let capacity_u64 = burst.unwrap_or(limit).max(1);
+		let capacity_u64 = limit.max(1);
 		let capacity = capacity_u64 as f64;
 		let refill_per_second = limit as f64 / period.as_secs_f64().max(f64::EPSILON);
 		let now_ms = now_millis();
-		let local_key = local_cache_key(key_hash, limit, period, burst);
+		let local_key = local_cache_key(key_hash, limit, period);
 		if self.take_local_lease(local_key, now_ms) {
 			return Ok(true);
 		}
@@ -277,35 +271,28 @@ impl RateLimiter {
 	}
 
 	fn take_local_lease(&self, key: u64, now_ms: u64) -> bool {
-		if self.hot_lease_key.load(Ordering::Relaxed) != key {
+		let mut lease = self.hot_lease.lock().unwrap_or_else(|e| e.into_inner());
+		let Some(current) = lease.as_mut() else {
+			return false;
+		};
+		if current.key != key || current.expires_at_ms <= now_ms || current.tokens == 0 {
+			*lease = None;
 			return false;
 		}
-		if self.hot_lease_expires_at_ms.load(Ordering::Relaxed) <= now_ms {
-			self.hot_lease_tokens.store(0, Ordering::Relaxed);
-			return false;
-		}
-		let mut tokens = self.hot_lease_tokens.load(Ordering::Relaxed);
-		while tokens > 0 {
-			match self.hot_lease_tokens.compare_exchange_weak(
-				tokens,
-				tokens - 1,
-				Ordering::Relaxed,
-				Ordering::Relaxed,
-			) {
-				Ok(_) => return true,
-				Err(current) => tokens = current,
-			}
-		}
-		false
+		current.tokens -= 1;
+		true
 	}
 
 	fn store_local_lease(&self, key: u64, tokens: u64, expires_at_ms: u64) {
 		if tokens == 0 {
 			return;
 		}
-		self.hot_lease_expires_at_ms.store(expires_at_ms, Ordering::Relaxed);
-		self.hot_lease_tokens.store(tokens, Ordering::Relaxed);
-		self.hot_lease_key.store(key, Ordering::Relaxed);
+		let mut lease = self.hot_lease.lock().unwrap_or_else(|e| e.into_inner());
+		*lease = Some(LocalLease {
+			key,
+			tokens,
+			expires_at_ms,
+		});
 	}
 
 	async fn cleanup_expired(&self, txn: &Transaction, now_ms: u64) -> Result<()> {
@@ -389,11 +376,10 @@ fn reservation_size(limit: u64, capacity: u64) -> u64 {
 	capacity.min(limit.max(1)).clamp(1, 1024)
 }
 
-fn local_cache_key(key_hash: u64, limit: u64, period: Duration, burst: Option<u64>) -> u64 {
+fn local_cache_key(key_hash: u64, limit: u64, period: Duration) -> u64 {
 	let mut hash = key_hash;
 	hash = stable_hash_extend(hash, &limit.to_be_bytes());
 	hash = stable_hash_extend(hash, &period.as_millis().to_be_bytes());
-	hash = stable_hash_extend(hash, &burst.unwrap_or(0).to_be_bytes());
 	hash
 }
 
@@ -465,7 +451,7 @@ mod tests {
 		let tx = ds.transaction(TransactionType::Write, LockType::Optimistic).await.unwrap();
 		assert!(
 			limiter_a
-				.admit_kv(&tx, "shared".to_string(), 1, Duration::from_secs(3600), None)
+				.admit_kv(&tx, "shared".to_string(), 1, Duration::from_secs(3600))
 				.await
 				.unwrap()
 		);
@@ -474,10 +460,19 @@ mod tests {
 		let tx = ds.transaction(TransactionType::Write, LockType::Optimistic).await.unwrap();
 		assert!(
 			!limiter_b
-				.admit_kv(&tx, "shared".to_string(), 1, Duration::from_secs(3600), None)
+				.admit_kv(&tx, "shared".to_string(), 1, Duration::from_secs(3600))
 				.await
 				.unwrap()
 		);
 		tx.cancel().await.unwrap();
+	}
+
+	#[test]
+	fn local_lease_never_admits_a_different_key() {
+		let limiter = RateLimiter::default();
+		limiter.store_local_lease(1, 2, u64::MAX);
+
+		assert!(!limiter.take_local_lease(2, 0));
+		assert!(!limiter.take_local_lease(1, 0));
 	}
 }

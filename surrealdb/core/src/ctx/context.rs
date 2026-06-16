@@ -202,8 +202,8 @@ impl Context {
 			redact_volatile_explain_attrs: false,
 			statement_counters: None,
 			matches_context: None,
-			resource_budget: None,
-			rate_limiter: Arc::new(RateLimiter::default()),
+			resource_budget: parent.resource_budget.clone(),
+			rate_limiter: Arc::clone(&parent.rate_limiter),
 			knn_context: None,
 			config: Arc::clone(&parent.config),
 			#[cfg(feature = "http")]
@@ -1515,6 +1515,24 @@ mod tests {
 		snapshot.resource_budget().unwrap().charge(GovResourceKind::ResultRow, 3).unwrap();
 
 		assert_eq!(budget.usage().get(GovResourceKind::ResultRow), 6);
+	}
+
+	#[test]
+	fn context_budget_and_limiter_are_shared_with_background_work() {
+		use std::sync::Arc;
+
+		use crate::gov::{ResourceBudget, ResourceKind as GovResourceKind};
+
+		let budget = Arc::new(ResourceBudget::monitor(Default::default()));
+		let mut ctx = Context::new_test();
+		ctx.set_resource_budget(Arc::clone(&budget));
+		let limiter = Arc::clone(ctx.rate_limiter());
+
+		let background = Context::background(&ctx).freeze();
+		background.resource_budget().unwrap().charge(GovResourceKind::ResultRow, 7).unwrap();
+
+		assert_eq!(budget.usage().get(GovResourceKind::ResultRow), 7);
+		assert!(Arc::ptr_eq(&limiter, background.rate_limiter()));
 	}
 
 	#[tokio::test]

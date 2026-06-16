@@ -571,7 +571,7 @@ impl FieldEditContext<'_> {
 			if !self
 				.ctx
 				.rate_limiter()
-				.admit_kv(&self.ctx.tx(), key, policy.limit, policy.period, policy.burst)
+				.admit_kv(&self.ctx.tx(), key, policy.limit, policy.period)
 				.await?
 			{
 				bail!(Error::RateLimitExceeded {

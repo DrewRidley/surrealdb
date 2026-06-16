@@ -47,7 +47,6 @@ keyword! {
 	Begin => "BEGIN",
 	Blank => "BLANK",
 	Bucket => "BUCKET",
-	Burst => "BURST",
 	Reject => "REJECT",
 	Bm25 => "BM25",
 	Break => "BREAK",

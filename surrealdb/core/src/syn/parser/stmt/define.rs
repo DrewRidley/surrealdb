@@ -78,8 +78,7 @@ impl Parser<'_> {
 				condition: None,
 				bucket: Expr::Literal(Literal::None),
 				limit: scan,
-				period: period.clone(),
-				burst: None,
+				period,
 				scan: Some(scan),
 				scan_period: Some(period),
 				result: None,
@@ -121,19 +120,11 @@ impl Parser<'_> {
 		expected!(self, t!("PER"));
 		let period = self.next_token_value::<PublicDuration>()?;
 
-		let burst = if self.eat(t!("BURST")) {
-			Some(self.next_token_value::<u64>()?)
-		} else {
-			None
-		};
 		let (scan, scan_period) = if self.eat(t!("SCAN")) {
 			let scan = self.next_token_value::<u64>()?;
-			let period = if self.eat(t!("PER")) {
-				Some(self.next_token_value::<PublicDuration>()?)
-			} else {
-				None
-			};
-			(Some(scan), period)
+			expected!(self, t!("PER"));
+			let period = self.next_token_value::<PublicDuration>()?;
+			(Some(scan), Some(period))
 		} else {
 			(None, None)
 		};
@@ -149,7 +140,6 @@ impl Parser<'_> {
 			bucket,
 			limit,
 			period,
-			burst,
 			scan,
 			scan_period,
 			result,

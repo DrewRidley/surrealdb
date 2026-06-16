@@ -229,12 +229,8 @@ impl Executor {
 		let scan_key = scan_key.finish();
 
 		if policy.bucket.is_some() {
-			let locally_admitted = self.ctx.rate_limiter().admit_local_hash(
-				key,
-				policy.limit,
-				policy.period,
-				policy.burst,
-			);
+			let locally_admitted =
+				self.ctx.rate_limiter().admit_local_hash(key, policy.limit, policy.period);
 			if !locally_admitted {
 				if !txn.writeable() {
 					return Err(ControlFlow::Err(anyhow::Error::new(RateLimitRequiresWrite)));
@@ -242,7 +238,7 @@ impl Executor {
 				if !self
 					.ctx
 					.rate_limiter()
-					.admit_kv_hash(txn, key, policy.limit, policy.period, policy.burst)
+					.admit_kv_hash(txn, key, policy.limit, policy.period)
 					.await?
 				{
 					return Err(ControlFlow::Err(anyhow::Error::new(Error::RateLimitExceeded {
@@ -327,7 +323,6 @@ impl Executor {
 						scan_key_seed,
 						limit: policy.limit,
 						period: policy.period,
-						burst: policy.burst,
 						scan: policy.scan,
 						scan_period: policy.scan_period,
 						result: policy.result,
@@ -375,7 +370,6 @@ impl Executor {
 							scan_key_seed: scan_key_seed.finish(),
 							limit: policy.limit,
 							period: policy.period,
-							burst: policy.burst,
 							scan: policy.scan,
 							scan_period: policy.scan_period,
 							result: policy.result,
@@ -416,12 +410,8 @@ impl Executor {
 				let mut scan_key = StableHasher::from_hash(key);
 				"scan".hash(&mut scan_key);
 				let scan_key = scan_key.finish();
-				let locally_admitted = self.ctx.rate_limiter().admit_local_hash(
-					key,
-					policy.limit,
-					policy.period,
-					policy.burst,
-				);
+				let locally_admitted =
+					self.ctx.rate_limiter().admit_local_hash(key, policy.limit, policy.period);
 				if !locally_admitted {
 					if !txn.writeable() {
 						return Err(ControlFlow::Err(anyhow::Error::new(RateLimitRequiresWrite)));
@@ -429,7 +419,7 @@ impl Executor {
 					if !self
 						.ctx
 						.rate_limiter()
-						.admit_kv_hash(&txn, key, policy.limit, policy.period, policy.burst)
+						.admit_kv_hash(&txn, key, policy.limit, policy.period)
 						.await?
 					{
 						return Err(ControlFlow::Err(anyhow::Error::new(
@@ -2814,13 +2804,13 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn inline_table_ratelimit_burst_allows_initial_capacity() {
+	async fn inline_table_ratelimit_limit_implies_initial_token_capacity() {
 		let ds = Datastore::new("memory").await.unwrap();
 		let sess = Session::owner().with_ns("NS").with_db("DB");
 
 		ds.execute(
 			"DEFINE NAMESPACE NS; USE NS NS; DEFINE DATABASE DB; \
-			 DEFINE TABLE person RATELIMIT FOR SELECT BY $session.id LIMIT 1 PER 1h BURST 2; \
+			 DEFINE TABLE person RATELIMIT FOR SELECT BY $session.id LIMIT 2 PER 1h; \
 			 CREATE person:1;",
 			&sess,
 			None,
@@ -2890,7 +2880,7 @@ mod tests {
 
 		ds.execute(
 			"DEFINE NAMESPACE NS; USE NS NS; DEFINE DATABASE DB; \
-			 DEFINE TABLE person RATELIMIT FOR SELECT BY $session.id LIMIT 100 PER 1s SCAN 100 RESULT 1; \
+			 DEFINE TABLE person RATELIMIT FOR SELECT BY $session.id LIMIT 100 PER 1s SCAN 100 PER 1h RESULT 1; \
 			 CREATE person:1; CREATE person:2;",
 			&sess,
 			None,
@@ -2955,7 +2945,7 @@ mod tests {
 
 		ds.execute(
 			"DEFINE NAMESPACE NS; USE NS NS; DEFINE DATABASE DB; \
-			 DEFINE TABLE person RATELIMIT FOR SELECT BY $session.id LIMIT 100 PER 1s SCAN 2; \
+			 DEFINE TABLE person RATELIMIT FOR SELECT BY $session.id LIMIT 100 PER 1s SCAN 2 PER 1h; \
 			 CREATE person:1; CREATE person:2; CREATE person:3;",
 			&sess,
 			None,

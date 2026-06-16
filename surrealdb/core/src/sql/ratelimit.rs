@@ -12,7 +12,6 @@ pub(crate) struct RateLimit {
 	pub bucket: Expr,
 	pub limit: u64,
 	pub period: PublicDuration,
-	pub burst: Option<u64>,
 	pub scan: Option<u64>,
 	pub scan_period: Option<PublicDuration>,
 	pub result: Option<u64>,
@@ -25,13 +24,8 @@ impl RateLimit {
 		f.push_str("FOR ");
 		if self.actions.is_empty() {
 			if let Some(scan) = self.scan {
-				write_sql!(
-					f,
-					sql_fmt,
-					"SCAN {} PER {}",
-					scan,
-					self.scan_period.as_ref().unwrap_or(&self.period)
-				);
+				let period = self.scan_period.as_ref().unwrap_or(&self.period);
+				write_sql!(f, sql_fmt, "SCAN {} PER {}", scan, period);
 			}
 			return;
 		}
@@ -46,14 +40,9 @@ impl RateLimit {
 		}
 		write_sql!(f, sql_fmt, " BY {}", CoverStmts(&self.bucket));
 		write_sql!(f, sql_fmt, " LIMIT {} PER {}", self.limit, self.period);
-		if let Some(burst) = self.burst {
-			write_sql!(f, sql_fmt, " BURST {}", burst);
-		}
 		if let Some(scan) = self.scan {
-			write_sql!(f, sql_fmt, " SCAN {}", scan);
-			if let Some(period) = &self.scan_period {
-				write_sql!(f, sql_fmt, " PER {}", period);
-			}
+			let period = self.scan_period.as_ref().unwrap_or(&self.period);
+			write_sql!(f, sql_fmt, " SCAN {} PER {}", scan, period);
 		}
 		if let Some(result) = self.result {
 			write_sql!(f, sql_fmt, " RESULT {}", result);
@@ -89,10 +78,39 @@ impl From<crate::catalog::RateLimit> for RateLimit {
 			bucket: v.bucket.into(),
 			limit: v.limit,
 			period: v.period.into(),
-			burst: v.burst,
 			scan: v.scan,
 			scan_period: v.scan_period.map(PublicDuration::from_std),
 			result: v.result,
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::time::Duration;
+
+	use surrealdb_types::ToSql;
+
+	use super::RateLimit;
+	use crate::sql::{Expr, Literal, PermissionKind};
+	use crate::types::PublicDuration;
+
+	#[test]
+	fn scan_period_falls_back_to_limit_period_when_absent() {
+		let ratelimit = RateLimit {
+			actions: vec![PermissionKind::Select],
+			condition: None,
+			bucket: Expr::Literal(Literal::String("bucket".into())),
+			limit: 10,
+			period: PublicDuration::from(Duration::from_secs(60)),
+			scan: Some(100),
+			scan_period: None,
+			result: None,
+		};
+
+		assert_eq!(
+			ratelimit.to_sql(),
+			"RATELIMIT FOR SELECT BY 'bucket' LIMIT 10 PER 1m SCAN 100 PER 1m"
+		);
 	}
 }

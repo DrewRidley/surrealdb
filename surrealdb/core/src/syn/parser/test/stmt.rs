@@ -3090,7 +3090,7 @@ fn parse_access_purge() {
 #[test]
 fn parse_define_table_ratelimit() {
 	let res = syn::parse_with(
-		r#"DEFINE TABLE post RATELIMIT FOR SELECT WHERE $auth IS NONE BY $session.ip LIMIT 2 PER 1s BURST 4 SCAN 100 RESULT 20"#.as_bytes(),
+		r#"DEFINE TABLE post RATELIMIT FOR SELECT WHERE $auth IS NONE BY $session.ip LIMIT 2 PER 1s SCAN 100 PER 1m RESULT 20"#.as_bytes(),
 		async |parser, stk| parser.parse_expr_inherit(stk).await,
 	)
 	.unwrap();
@@ -3104,8 +3104,8 @@ fn parse_define_table_ratelimit() {
 				assert!(limit.condition.is_some());
 				assert_eq!(limit.limit, 2);
 				assert_eq!(limit.period, PublicDuration::from_secs(1));
-				assert_eq!(limit.burst, Some(4));
 				assert_eq!(limit.scan, Some(100));
+				assert_eq!(limit.scan_period, Some(PublicDuration::from_secs(60)));
 				assert_eq!(limit.result, Some(20));
 			}
 			_ => panic!("expected table definition"),
