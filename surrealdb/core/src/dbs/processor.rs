@@ -16,28 +16,11 @@ use crate::err::Error;
 use crate::expr::dir::Dir;
 use crate::expr::lookup::{ComputedLookupSubject, LookupKind};
 use crate::expr::statements::relate::RelateThrough;
-use crate::gov::{ChargeOutcome, ResourceKind as GovResourceKind};
 use crate::idx::planner::iterators::{IndexItemRecord, IteratorRef, RecordIterator};
 use crate::idx::planner::{IterationStage, RecordStrategy, ScanDirection};
 use crate::key::{graph, record, r#ref};
 use crate::kvs::{KVKey, KVValue, Key, NORMAL_BATCH_SIZE, ScanLimit, Transaction, Val};
 use crate::val::{RecordId, RecordIdKey, RecordIdKeyRange, TableName, Value};
-
-fn charge_scanned_record(ctx: &FrozenContext, ite: &mut Iterator) -> Result<bool> {
-	let Some(budget) = ctx.resource_budget() else {
-		return Ok(true);
-	};
-	match budget.charge_or_truncate(GovResourceKind::ScanKey, 1)? {
-		ChargeOutcome::Charged => {
-			budget.charge(GovResourceKind::RowRead, 1)?;
-			Ok(true)
-		}
-		ChargeOutcome::Truncated(_, _) => {
-			ite.cancel();
-			Ok(false)
-		}
-	}
-}
 
 impl Iterable {
 	#[instrument(level = "trace", name = "Iterable::iterate", skip_all)]
@@ -574,12 +557,26 @@ pub(super) struct ConcurrentCollector<'a> {
 	stm: &'a Statement<'a>,
 	ite: &'a mut Iterator,
 }
+/// Meter one scanned record against the statement's SELECT rate limits.
+/// Reservation-ahead: the meter denies mid-scan when the budget runs out,
+/// so an expensive scan is bounded regardless of how few rows it returns.
+///
+/// The consume future (bucket reservation chain) is boxed so it does not
+/// inflate the per-record collector future: these futures are copied onto
+/// the reblessive task stack per record, and their size is stack budget.
+/// The allocation only happens when a meter is installed (a SELECT with
+/// rate-limit policies) and its reservation has actually run dry.
+async fn meter_scanned_record(ctx: &FrozenContext) -> Result<()> {
+	if let Some(meter) = ctx.scan_ratelimit_meter() {
+		Box::pin(meter.consume(1)).await?;
+	}
+	Ok(())
+}
+
 impl Collector for ConcurrentCollector<'_> {
 	#[instrument(level = "trace", skip_all)]
 	async fn collect(&mut self, collectable: Collectable) -> Result<()> {
-		if !charge_scanned_record(self.ctx, self.ite)? {
-			return Ok(());
-		}
+		meter_scanned_record(self.ctx).await?;
 
 		// if it is skippable don't need to process the document
 		if self.ite.skippable() > 0 {
@@ -606,9 +603,7 @@ pub(super) struct ConcurrentDistinctCollector<'a> {
 impl Collector for ConcurrentDistinctCollector<'_> {
 	#[instrument(level = "trace", skip_all)]
 	async fn collect(&mut self, collectable: Collectable) -> Result<()> {
-		if !charge_scanned_record(self.coll.ctx, self.coll.ite)? {
-			return Ok(());
-		}
+		meter_scanned_record(self.coll.ctx).await?;
 
 		let skippable = self.coll.ite.skippable() > 0;
 		// If it is skippable, we just need to collect the record id (if any)

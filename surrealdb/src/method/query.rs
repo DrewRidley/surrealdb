@@ -157,7 +157,7 @@ where
 				let stats = DbResultStats::default()
 					.with_execution_time(result.time)
 					.with_query_type(result.query_type)
-					.with_optional_partial_reason(result.partial);
+					.with_partial_reason(result.partial);
 
 				match result.query_type {
 					QueryType::Other => {
@@ -723,7 +723,8 @@ mod tests {
 
 	#[test]
 	fn with_stats_take_exposes_partial_reason() {
-		let stats = DbResultStats::default().with_partial_reason(crate::PartialReason::ScanLimit);
+		let stats =
+			DbResultStats::default().with_partial_reason(Some(crate::PartialReason::ScanLimit));
 		let mut response = WithStats(IndexedResults {
 			results: IndexMap::from([(
 				0,

@@ -2951,6 +2951,20 @@ impl Datastore {
 		self.transaction_factory.transaction(write, lock, self.sequences.clone()).await
 	}
 
+	/// A transaction source for rate-limit charge settlement, usable from
+	/// contexts that carry no datastore handle (scan operators, document
+	/// processing).
+	pub(crate) fn ratelimit_charge_session(
+		&self,
+		tenant: Option<Arc<crate::observe::TenantIdentity>>,
+	) -> crate::gov::ChargeSession {
+		crate::gov::ChargeSession::new(
+			self.transaction_factory.clone(),
+			self.sequences.clone(),
+			tenant,
+		)
+	}
+
 	pub(crate) fn sequences(&self) -> &Sequences {
 		&self.sequences
 	}

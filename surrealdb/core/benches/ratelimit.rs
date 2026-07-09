@@ -5,8 +5,6 @@ mod common;
 
 use common::{block_on, setup_datastore_with_query};
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use surrealdb_core::dbs::{Capabilities, Session};
-use surrealdb_core::kvs::Datastore;
 
 // ============================================================================
 // Benchmark: RATELIMIT admission overhead
@@ -18,10 +16,13 @@ fn bench_ratelimit_admission(c: &mut Criterion) {
 
 	let (baseline_dbs, baseline_ses) =
 		block_on(setup_datastore_with_query("CREATE item:test SET name = 'baseline', age = 30;"));
-	let (limited_dbs, limited_ses) = block_on(setup_datastore_with_query(
+	let (limited_dbs, mut limited_ses) = block_on(setup_datastore_with_query(
 		"DEFINE TABLE item RATELIMIT FOR SELECT BY $session.id LIMIT 100000000 PER 1h; \
 		 CREATE item:test SET name = 'limited', age = 30;",
 	));
+	// Rate limits fail closed on a NONE key: without a session id this
+	// benchmark would measure the (cheap) denial path, not admission.
+	limited_ses.id = Some(uuid::Uuid::new_v4());
 	let (where_false_dbs, where_false_ses) = block_on(setup_datastore_with_query(
 		"DEFINE TABLE item RATELIMIT FOR SELECT WHERE false BY $session.id LIMIT 1 PER 1h; \
 		 CREATE item:test SET name = 'where_false', age = 30;",
@@ -54,59 +55,54 @@ fn bench_ratelimit_admission(c: &mut Criterion) {
 	group.finish();
 }
 
-// ============================================================================
-// Benchmark: RATELIMIT scan quota overhead
-// ============================================================================
-
-async fn setup_ratelimit_scan_datastore(
-	ratelimit: Option<&str>,
-	count: u64,
-) -> (Datastore, Session) {
-	let dbs = Datastore::builder()
-		.with_capabilities(Capabilities::all())
-		.build_with_path("memory")
-		.await
-		.unwrap();
-	let ses = Session::owner().with_ns("test").with_db("test");
-	dbs.execute("USE NAMESPACE test DATABASE test", &ses, None).await.unwrap();
-	if let Some(ratelimit) = ratelimit {
-		dbs.execute(ratelimit, &ses, None).await.unwrap();
-	}
-	for i in 0..count {
-		dbs.execute(&format!("CREATE item:{i} SET value = {i};"), &ses, None).await.unwrap();
-	}
-	(dbs, ses)
-}
-
-fn bench_ratelimit_scan(c: &mut Criterion) {
-	let mut group = c.benchmark_group("ratelimit_scan");
+/// Denial-path costs. Under sustained abuse, denial is the steady state:
+/// its cost is the amplification an abuser gets per rejected request, so it
+/// must be cheap and — critically — independent of how expensive the denied
+/// query would have been.
+fn bench_ratelimit_denial(c: &mut Criterion) {
+	let mut group = c.benchmark_group("ratelimit_denial");
 	let runtime = common::create_runtime();
-	let count = 100;
 
-	let (baseline_dbs, baseline_ses) = block_on(setup_ratelimit_scan_datastore(None, count));
-	let (scan_dbs, scan_ses) = block_on(setup_ratelimit_scan_datastore(
-		Some("DEFINE TABLE item RATELIMIT FOR SCAN 1000000000 PER 1h;"),
-		count,
+	// Exhausted bucket: the setup query drains the single token; refill is
+	// 1/hour, so every benchmarked request is denied at admission.
+	let (drained_dbs, mut drained_ses) = block_on(setup_datastore_with_query(
+		"DEFINE TABLE item RATELIMIT FOR SELECT BY $session.id LIMIT 1 PER 1h; \
+		 CREATE item:test SET name = 'drained', age = 30;",
 	));
-	let (combined_dbs, combined_ses) = block_on(setup_ratelimit_scan_datastore(
-		Some(
-			"DEFINE TABLE item RATELIMIT \
-			 FOR SELECT BY $session.id LIMIT 100000000 PER 1h SCAN 1000000000 PER 1h RESULT 1000;",
-		),
-		count,
+	drained_ses.id = Some(uuid::Uuid::new_v4());
+
+	// Fail-closed key: no session id, so the BY key evaluates to NONE and
+	// the statement is denied before any bucket access.
+	let (none_key_dbs, none_key_ses) = block_on(setup_datastore_with_query(
+		"DEFINE TABLE item RATELIMIT FOR SELECT BY $session.id LIMIT 1000000 PER 1h; \
+		 CREATE item:test SET name = 'none_key', age = 30;",
 	));
 
-	group.throughput(Throughput::Elements(count));
-	group.bench_function("full_table_select_baseline", |b| {
-		b.to_async(&runtime)
-			.iter(|| async { query!(&baseline_dbs, &baseline_ses, "SELECT * FROM item;") });
+	// Expensive query, exhausted budget: a full-table scan over 256 rows
+	// against a capacity-2 bucket. The scan meter denies at the first
+	// reservation, so the denied cost must stay flat instead of scaling
+	// with the table.
+	let mut scan_setup =
+		String::from("DEFINE TABLE item RATELIMIT FOR SELECT BY $session.id LIMIT 2 PER 1h;");
+	for i in 0..256 {
+		scan_setup.push_str(&format!(" CREATE item:{i} SET name = 'row', age = {i};"));
+	}
+	let (scan_dbs, mut scan_ses) = block_on(setup_datastore_with_query(&scan_setup));
+	scan_ses.id = Some(uuid::Uuid::new_v4());
+
+	group.throughput(Throughput::Elements(1));
+	group.bench_function("denied_admission_exhausted_bucket", |b| {
+		b.to_async(&runtime).iter(|| async {
+			// Drain once in setup; every iteration here is a denial.
+			query!(&drained_dbs, &drained_ses, "SELECT * FROM item:test;")
+		});
 	});
-	group.bench_function("full_table_select_with_scan_quota", |b| {
+	group.bench_function("denied_fail_closed_none_key", |b| {
+		b.to_async(&runtime)
+			.iter(|| async { query!(&none_key_dbs, &none_key_ses, "SELECT * FROM item:test;") });
+	});
+	group.bench_function("denied_full_scan_exceeding_budget", |b| {
 		b.to_async(&runtime).iter(|| async { query!(&scan_dbs, &scan_ses, "SELECT * FROM item;") });
-	});
-	group.bench_function("full_table_select_with_admission_scan_and_result", |b| {
-		b.to_async(&runtime)
-			.iter(|| async { query!(&combined_dbs, &combined_ses, "SELECT * FROM item;") });
 	});
 
 	group.finish();
@@ -115,6 +111,6 @@ fn bench_ratelimit_scan(c: &mut Criterion) {
 criterion_group! {
 	name = benches;
 	config = Criterion::default();
-	targets = bench_ratelimit_admission, bench_ratelimit_scan,
+	targets = bench_ratelimit_admission, bench_ratelimit_denial,
 }
 criterion_main!(benches);

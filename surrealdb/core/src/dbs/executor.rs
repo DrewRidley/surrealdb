@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::pin::{Pin, pin};
 use std::sync::Arc;
@@ -33,8 +34,8 @@ use crate::expr::plan::LogicalPlan;
 use crate::expr::statements::{OptionStatement, UseStatement};
 use crate::expr::{Base, ControlFlow, Expr, FlowResult, Literal, Part, TopLevelExpr};
 use crate::gov::{
-	CachedRatelimitPolicy, FastRatelimitBucket, ResourceBudget, ResourceKind as GovResourceKind,
-	ResourceLimits, StableHasher,
+	BucketKey, BucketKeyHasher, CachedRatelimitPolicy, ChargeOutcome, FastRatelimitBucket,
+	PendingCharge, PlanIdentity, StableHasher,
 };
 use crate::iam::{Action, ResourceKind};
 use crate::kvs::slowlog::SlowLogVisit;
@@ -49,18 +50,7 @@ use crate::{catalog, err, expr, sql};
 
 const TARGET: &str = "surrealdb::core::dbs";
 
-#[derive(Debug)]
-struct RateLimitRequiresWrite;
-
-type TableRatelimitTargets = (catalog::PermissionKind, Vec<TableName>);
-
-impl std::fmt::Display for RateLimitRequiresWrite {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		f.write_str("rate limit admission requires a writable transaction")
-	}
-}
-
-impl std::error::Error for RateLimitRequiresWrite {}
+type TableRatelimitTargets = Vec<(catalog::PermissionKind, Vec<TableName>)>;
 
 struct PreparedBroker {
 	receiver: async_channel::Receiver<RoutedNotification>,
@@ -68,11 +58,12 @@ struct PreparedBroker {
 }
 
 #[derive(Clone, Debug)]
-struct ScanReservation {
-	key_hash: u64,
+struct PendingRecordRatelimit {
+	table_name: String,
+	key: BucketKey,
 	limit: u64,
 	period: Duration,
-	reserved: u64,
+	max: Option<u64>,
 }
 
 /// An executor which relies on the `compute` methods of the logical expressions.
@@ -88,7 +79,14 @@ pub struct Executor {
 	/// broker was already present (higher layer) or this statement skipped installation.
 	/// Drives conditional [`clear_broker`] so we never remove an externally supplied broker.
 	broker_owned_by_executor: bool,
-	scan_reservations: Vec<ScanReservation>,
+	/// Pending per-policy record-count buckets for the statement currently executing.
+	record_ratelimits: Vec<PendingRecordRatelimit>,
+	/// Table-level SELECT policies for the current statement, metered
+	/// reservation-ahead against rows scanned rather than charged post-hoc.
+	meter_policies: Vec<PendingCharge>,
+	/// The installed scan meter for the current statement, kept here so the
+	/// epilogue can settle (refund) it on every outcome.
+	scan_meter: Option<Arc<crate::gov::ScanRatelimitMeter>>,
 }
 
 impl Executor {
@@ -102,44 +100,81 @@ impl Executor {
 			}
 		}
 
-		let (action, targets): (catalog::PermissionKind, Vec<&Expr>) = match plan {
-			TopLevelExpr::Expr(Expr::Select(stmt)) => {
-				(catalog::PermissionKind::Select, stmt.what.iter().collect())
-			}
-			TopLevelExpr::Expr(Expr::Create(stmt)) => {
-				(catalog::PermissionKind::Create, stmt.what.iter().collect())
-			}
-			TopLevelExpr::Expr(Expr::Update(stmt)) => {
-				(catalog::PermissionKind::Update, stmt.what.iter().collect())
-			}
-			TopLevelExpr::Expr(Expr::Upsert(stmt)) => {
-				(catalog::PermissionKind::Update, stmt.what.iter().collect())
-			}
-			TopLevelExpr::Expr(Expr::Delete(stmt)) => {
-				(catalog::PermissionKind::Delete, stmt.what.iter().collect())
-			}
-			TopLevelExpr::Expr(Expr::Insert(stmt)) => {
-				let Some(into) = &stmt.into else {
-					return None;
-				};
-				(catalog::PermissionKind::Create, vec![into])
-			}
-			TopLevelExpr::Expr(Expr::Relate(stmt)) => {
-				(catalog::PermissionKind::Create, vec![&stmt.through])
-			}
-			_ => return None,
-		};
+		fn push_targets(targets: &mut Vec<TableName>, exprs: &[Expr]) {
+			targets.extend(exprs.iter().filter_map(target_name));
+		}
 
-		let targets = targets.into_iter().filter_map(target_name).collect::<Vec<_>>();
+		fn collect_expr_targets(expr: &Expr, out: &mut TableRatelimitTargets) {
+			match expr {
+				Expr::Select(stmt) => {
+					let mut targets = Vec::with_capacity(stmt.what.len());
+					push_targets(&mut targets, &stmt.what);
+					if !targets.is_empty() {
+						out.push((catalog::PermissionKind::Select, targets));
+					}
+				}
+				Expr::Create(stmt) => {
+					let mut targets = Vec::with_capacity(stmt.what.len());
+					push_targets(&mut targets, &stmt.what);
+					if !targets.is_empty() {
+						out.push((catalog::PermissionKind::Create, targets));
+					}
+				}
+				Expr::Update(stmt) => {
+					let mut targets = Vec::with_capacity(stmt.what.len());
+					push_targets(&mut targets, &stmt.what);
+					if !targets.is_empty() {
+						out.push((catalog::PermissionKind::Update, targets));
+					}
+				}
+				Expr::Upsert(stmt) => {
+					let mut targets = Vec::with_capacity(stmt.what.len());
+					push_targets(&mut targets, &stmt.what);
+					if !targets.is_empty() {
+						out.push((catalog::PermissionKind::Update, targets));
+					}
+				}
+				Expr::Delete(stmt) => {
+					let mut targets = Vec::with_capacity(stmt.what.len());
+					push_targets(&mut targets, &stmt.what);
+					if !targets.is_empty() {
+						out.push((catalog::PermissionKind::Delete, targets));
+					}
+				}
+				Expr::Insert(stmt) => {
+					if let Some(table) = stmt.into.as_ref().and_then(target_name) {
+						out.push((catalog::PermissionKind::Create, vec![table]));
+					}
+				}
+				Expr::Relate(stmt) => {
+					if let Some(table) = target_name(&stmt.through) {
+						out.push((catalog::PermissionKind::Create, vec![table]));
+					}
+				}
+				Expr::Let(stmt) => collect_expr_targets(&stmt.what, out),
+				Expr::Block(block) => {
+					for expr in &block.0 {
+						collect_expr_targets(expr, out);
+					}
+				}
+				Expr::Return(stmt) => collect_expr_targets(&stmt.what, out),
+				Expr::Explain {
+					statement,
+					..
+				} => collect_expr_targets(statement, out),
+				_ => {}
+			}
+		}
+
+		let mut targets = Vec::new();
+		if let TopLevelExpr::Expr(expr) = plan {
+			collect_expr_targets(expr, &mut targets);
+		}
 		if targets.is_empty() {
 			None
 		} else {
-			Some((action, targets))
+			Some(targets)
 		}
-	}
-
-	fn merge_limit(slot: &mut Option<u64>, candidate: u64) {
-		*slot = Some(slot.map(|current| current.min(candidate)).unwrap_or(candidate));
 	}
 
 	fn fast_ratelimit_bucket(expr: &Expr) -> Option<FastRatelimitBucket> {
@@ -165,396 +200,360 @@ impl Executor {
 		}
 	}
 
-	fn hash_fast_session_ratelimit_bucket<H: Hasher>(
+	/// Feed the selected session field into the bucket key hasher.
+	///
+	/// Returns `false` when the field is absent from the session. Rate
+	/// limits fail closed: the caller turns a missing key into a denial
+	/// instead of merging every key-less session into one shared bucket,
+	/// which would let any key-less code path void the policy.
+	fn hash_fast_session_ratelimit_bucket(
 		&mut self,
 		bucket: FastRatelimitBucket,
-		hash: &mut H,
-	) {
-		bucket.hash(hash);
-		let Some(session) = self.get_session_info() else {
-			Value::None.hash(hash);
-			return;
-		};
-		match bucket {
-			FastRatelimitBucket::Id => session.id.hash(hash),
-			FastRatelimitBucket::Ip => session.ip.hash(hash),
-			FastRatelimitBucket::Ns => session.ns.hash(hash),
-			FastRatelimitBucket::Db => session.db.hash(hash),
-			FastRatelimitBucket::Origin => session.origin.hash(hash),
-			FastRatelimitBucket::Auth => session.ac.hash(hash),
-			FastRatelimitBucket::Record => session.rd.hash(hash),
-			FastRatelimitBucket::Token => session.token.hash(hash),
-		}
-	}
-
-	async fn reserve_scan_quota(
-		&mut self,
-		kvs: &Datastore,
-		key_hash: u64,
-		limit: u64,
-		period: Duration,
-	) -> FlowResult<u64> {
-		let txn = kvs
-			.transaction(TransactionType::Write, LockType::Optimistic)
-			.await?
-			.with_tenant_identity(self.ctx.tenant_identity().cloned());
-		let reserved =
-			self.ctx.rate_limiter().reserve_kv_hash(&txn, key_hash, limit, period, limit).await?;
-		txn.commit().await?;
-		self.scan_reservations.push(ScanReservation {
-			key_hash,
-			limit,
-			period,
-			reserved,
-		});
-		Ok(reserved)
-	}
-
-	async fn admit_cached_table_ratelimit_policy(
-		&mut self,
-		kvs: &Datastore,
-		txn: &Transaction,
-		table_name: &str,
-		policy: &CachedRatelimitPolicy,
-		scan: &mut Option<u64>,
-		result: &mut Option<u64>,
-	) -> FlowResult<()> {
-		let mut key = StableHasher::from_hash(policy.key_seed);
-		let mut scan_key = StableHasher::from_hash(policy.scan_key_seed);
-		if let Some(bucket) = policy.bucket {
-			self.hash_fast_session_ratelimit_bucket(bucket, &mut key);
-			self.hash_fast_session_ratelimit_bucket(bucket, &mut scan_key);
-		}
-		let key = key.finish();
-		let scan_key = scan_key.finish();
-
-		if policy.bucket.is_some() {
-			let locally_admitted =
-				self.ctx.rate_limiter().admit_local_hash(key, policy.limit, policy.period);
-			if !locally_admitted {
-				if !txn.writeable() {
-					return Err(ControlFlow::Err(anyhow::Error::new(RateLimitRequiresWrite)));
+		hash: &mut BucketKeyHasher,
+	) -> bool {
+		fn feed<T: Hash>(value: &Option<T>, hash: &mut BucketKeyHasher) -> bool {
+			match value {
+				Some(value) => {
+					value.hash(hash);
+					true
 				}
-				if !self
-					.ctx
-					.rate_limiter()
-					.admit_kv_hash(txn, key, policy.limit, policy.period)
-					.await?
-				{
-					return Err(ControlFlow::Err(anyhow::Error::new(Error::RateLimitExceeded {
-						scope: format!("table {table_name}"),
-					})));
-				}
+				None => false,
 			}
 		}
+		let Some(session) = self.get_session_info() else {
+			return false;
+		};
+		bucket.hash(hash);
+		match bucket {
+			FastRatelimitBucket::Id => feed(&session.id, hash),
+			FastRatelimitBucket::Ip => feed(&session.ip, hash),
+			FastRatelimitBucket::Ns => feed(&session.ns, hash),
+			FastRatelimitBucket::Db => feed(&session.db, hash),
+			FastRatelimitBucket::Origin => feed(&session.origin, hash),
+			FastRatelimitBucket::Auth => feed(&session.ac, hash),
+			FastRatelimitBucket::Record => feed(&session.rd, hash),
+			FastRatelimitBucket::Token => feed(&session.token, hash),
+		}
+	}
 
-		if let Some(limit) = policy.scan {
-			let limit = if let Some(period) = policy.scan_period {
-				self.reserve_scan_quota(kvs, scan_key, limit, period).await?
-			} else {
-				limit
-			};
-			Self::merge_limit(scan, limit);
+	fn push_pending_policy(
+		&mut self,
+		table_name: &str,
+		key: BucketKey,
+		limit: u64,
+		period: Duration,
+		max: Option<u64>,
+		is_select: bool,
+	) {
+		if is_select {
+			// SELECT policies meter rows scanned, reservation-ahead, so a
+			// single query is bounded mid-flight and a selective filter
+			// cannot make an expensive scan look cheap.
+			self.meter_policies.push(PendingCharge {
+				scope: format!("table {table_name}"),
+				key,
+				limit,
+				period,
+				max,
+				amount: 0,
+			});
+		} else {
+			self.record_ratelimits.push(PendingRecordRatelimit {
+				table_name: table_name.to_owned(),
+				key,
+				limit,
+				period,
+				max,
+			});
 		}
-		if let Some(limit) = policy.result {
-			Self::merge_limit(result, limit);
+	}
+
+	fn add_cached_table_ratelimit_policy(
+		&mut self,
+		table_name: &str,
+		policy: &CachedRatelimitPolicy,
+		is_select: bool,
+	) -> Result<()> {
+		let mut key = policy.key_seed.clone();
+		if let Some(bucket) = policy.bucket
+			&& !self.hash_fast_session_ratelimit_bucket(bucket, &mut key)
+		{
+			bail!(Error::RateLimitKeyUnavailable {
+				scope: format!("table {table_name}"),
+			});
 		}
+		self.push_pending_policy(
+			table_name,
+			key.finalize(),
+			policy.limit,
+			policy.period,
+			policy.max,
+			is_select,
+		);
 		Ok(())
 	}
 
-	async fn inline_ratelimit_resource_limits(
+	async fn collect_inline_ratelimit_policies(
 		&mut self,
-		kvs: &Datastore,
 		txn: Arc<Transaction>,
 		table_ratelimit_targets: Option<&TableRatelimitTargets>,
-	) -> FlowResult<Option<ResourceLimits>> {
-		let Some((action, targets)) = table_ratelimit_targets else {
-			return Ok(None);
+	) -> FlowResult<()> {
+		// Always reset: charges pending from a previous statement in this
+		// executor must never be settled against this statement's counts.
+		self.record_ratelimits.clear();
+		self.meter_policies.clear();
+		let Some(table_ratelimit_targets) = table_ratelimit_targets else {
+			return Ok(());
 		};
 
-		self.scan_reservations.clear();
-		let mut scan = None;
-		let mut result = None;
-
-		for table_target in targets {
-			let table_name = table_target.to_string();
-			let mut plan_key = StableHasher::new();
-			self.opt.ns()?.hash(&mut plan_key);
-			self.opt.db()?.hash(&mut plan_key);
-			table_name.hash(&mut plan_key);
-			action.as_str().hash(&mut plan_key);
-			let plan_key = plan_key.finish();
-			let key_seed = StableHasher::from_hash(plan_key);
-
-			if let Some(cached) = self.ctx.rate_limiter().cached_table_plan_by_key(plan_key) {
-				for policy in cached.iter() {
-					self.admit_cached_table_ratelimit_policy(
-						kvs,
-						&txn,
-						&table_name,
-						policy,
-						&mut scan,
-						&mut result,
-					)
-					.await?;
-				}
-				continue;
-			}
-
-			let Some(table) =
-				txn.get_tb_by_name(self.opt.ns()?, self.opt.db()?, table_target, None).await?
-			else {
-				continue;
-			};
-			let mut cacheable = true;
-			let mut cached_policies = Vec::new();
-			for (policy_index, policy) in table.ratelimits.iter().enumerate() {
-				if policy.actions.is_empty() {
-					let mut scan_key_seed = StableHasher::new();
-					self.opt.ns()?.hash(&mut scan_key_seed);
-					self.opt.db()?.hash(&mut scan_key_seed);
-					table_name.hash(&mut scan_key_seed);
-					"scan".hash(&mut scan_key_seed);
-					policy_index.hash(&mut scan_key_seed);
-					let scan_key_seed = scan_key_seed.finish();
-					let cached = CachedRatelimitPolicy {
-						bucket: None,
-						key_seed: scan_key_seed,
-						scan_key_seed,
-						limit: policy.limit,
-						period: policy.period,
-						scan: policy.scan,
-						scan_period: policy.scan_period,
-						result: policy.result,
-					};
-					self.admit_cached_table_ratelimit_policy(
-						kvs,
-						&txn,
-						&table_name,
-						&cached,
-						&mut scan,
-						&mut result,
-					)
-					.await?;
-					cached_policies.push(cached);
+		for (action, targets) in table_ratelimit_targets {
+			let is_select = matches!(action, catalog::PermissionKind::Select);
+			for table_target in targets {
+				let table_name = table_target.to_string();
+				let ns = self.opt.ns()?.to_string();
+				let db = self.opt.db()?.to_string();
+				// Fetch the table definition first (transaction-cached):
+				// its `cache_tables_ts` stamp versions the plan cache, so a
+				// schema change on any node invalidates cached plans here.
+				let Some(table) = txn.get_tb_by_name(&ns, &db, table_target, None).await? else {
+					continue;
+				};
+				if table.ratelimits.is_empty() {
 					continue;
 				}
-				if !policy.actions.contains(action) {
+				let mut plan_key = StableHasher::new();
+				ns.hash(&mut plan_key);
+				db.hash(&mut plan_key);
+				table_name.hash(&mut plan_key);
+				action.as_str().hash(&mut plan_key);
+				let plan_key = plan_key.finish();
+				let identity = PlanIdentity {
+					ns,
+					db,
+					table: table_name.clone(),
+					action: action.as_str().to_string(),
+					schema_ts: table.cache_tables_ts,
+				};
+
+				if let Some(cached) = self.ctx.rate_limiter().cached_table_plan(plan_key, &identity)
+				{
+					for policy in cached.iter() {
+						self.add_cached_table_ratelimit_policy(&table_name, policy, is_select)?;
+					}
 					continue;
 				}
-
-				if let Some(condition) = &policy.condition {
-					cacheable = false;
-					let opt_no_perms = self.opt.new_with_perms(false);
-					let applies = self
-						.stack
-						.enter(|stk| condition.compute(stk, &self.ctx, &opt_no_perms, None))
-						.finish()
-						.await?
-						.is_truthy();
-					if !applies {
+				let mut cacheable = true;
+				let mut cached_policies = Vec::new();
+				for (policy_index, policy) in table.ratelimits.iter().enumerate() {
+					if !policy.actions.contains(action) {
 						continue;
 					}
-				}
 
-				let cached = if policy.condition.is_none() {
-					Self::fast_ratelimit_bucket(&policy.bucket).map(|bucket| {
-						let mut key_seed = StableHasher::from_hash(key_seed.finish());
-						policy_index.hash(&mut key_seed);
-						let key_seed = key_seed.finish();
-						let mut scan_key_seed = StableHasher::from_hash(key_seed);
-						"scan".hash(&mut scan_key_seed);
-						CachedRatelimitPolicy {
+					if let Some(condition) = &policy.condition {
+						cacheable = false;
+						let opt_no_perms = self.opt.new_with_perms(false);
+						let applies = self
+							.stack
+							.enter(|stk| condition.compute(stk, &self.ctx, &opt_no_perms, None))
+							.finish()
+							.await?
+							.is_truthy();
+						if !applies {
+							continue;
+						}
+					}
+
+					// Seed the bucket key with the policy identity. The fed
+					// byte stream is a persistence format: bucket state in
+					// the datastore is addressed by the finalized key, so
+					// this sequence must never change (see BucketKeyHasher).
+					let mut key_seed = BucketKeyHasher::new();
+					identity.ns.hash(&mut key_seed);
+					identity.db.hash(&mut key_seed);
+					table_name.hash(&mut key_seed);
+					action.as_str().hash(&mut key_seed);
+					policy_index.hash(&mut key_seed);
+
+					if policy.condition.is_none()
+						&& let Some(bucket) = Self::fast_ratelimit_bucket(&policy.bucket)
+					{
+						let cached = CachedRatelimitPolicy {
 							bucket: Some(bucket),
 							key_seed,
-							scan_key_seed: scan_key_seed.finish(),
 							limit: policy.limit,
 							period: policy.period,
-							scan: policy.scan,
-							scan_period: policy.scan_period,
-							result: policy.result,
-						}
-					})
-				} else {
-					None
-				};
-				if let Some(cached) = cached {
-					self.admit_cached_table_ratelimit_policy(
-						kvs,
-						&txn,
-						&table_name,
-						&cached,
-						&mut scan,
-						&mut result,
-					)
-					.await?;
-					cached_policies.push(cached);
-					continue;
-				}
-
-				cacheable = false;
-				let mut key = StableHasher::new();
-				self.opt.ns()?.hash(&mut key);
-				self.opt.db()?.hash(&mut key);
-				table_name.hash(&mut key);
-				action.as_str().hash(&mut key);
-				policy_index.hash(&mut key);
-				let opt_no_perms = self.opt.new_with_perms(false);
-				let bucket = self
-					.stack
-					.enter(|stk| policy.bucket.compute(stk, &self.ctx, &opt_no_perms, None))
-					.finish()
-					.await?;
-				bucket.hash(&mut key);
-				let key = key.finish();
-				let mut scan_key = StableHasher::from_hash(key);
-				"scan".hash(&mut scan_key);
-				let scan_key = scan_key.finish();
-				let locally_admitted =
-					self.ctx.rate_limiter().admit_local_hash(key, policy.limit, policy.period);
-				if !locally_admitted {
-					if !txn.writeable() {
-						return Err(ControlFlow::Err(anyhow::Error::new(RateLimitRequiresWrite)));
+							max: policy.max,
+						};
+						self.add_cached_table_ratelimit_policy(&table_name, &cached, is_select)?;
+						cached_policies.push(cached);
+						continue;
 					}
-					if !self
-						.ctx
-						.rate_limiter()
-						.admit_kv_hash(&txn, key, policy.limit, policy.period)
-						.await?
-					{
+
+					cacheable = false;
+					let opt_no_perms = self.opt.new_with_perms(false);
+					let bucket = self
+						.stack
+						.enter(|stk| policy.bucket.compute(stk, &self.ctx, &opt_no_perms, None))
+						.finish()
+						.await?;
+					// Fail closed: a NONE key would merge every key-less
+					// request into one shared bucket, voiding the policy.
+					if bucket.is_nullish() {
 						return Err(ControlFlow::Err(anyhow::Error::new(
-							Error::RateLimitExceeded {
+							Error::RateLimitKeyUnavailable {
 								scope: format!("table {table_name}"),
 							},
 						)));
 					}
+					let mut key = key_seed;
+					bucket.hash(&mut key);
+					self.push_pending_policy(
+						&table_name,
+						key.finalize(),
+						policy.limit,
+						policy.period,
+						policy.max,
+						is_select,
+					);
 				}
 
-				if let Some(limit) = policy.scan {
-					let limit = if let Some(period) = policy.scan_period {
-						self.reserve_scan_quota(kvs, scan_key, limit, period).await?
-					} else {
-						limit
-					};
-					Self::merge_limit(&mut scan, limit);
-				}
-				if let Some(limit) = policy.result {
-					Self::merge_limit(&mut result, limit);
+				if cacheable {
+					self.ctx.rate_limiter().store_table_plan(plan_key, identity, cached_policies);
 				}
 			}
-
-			if cacheable {
-				self.ctx.rate_limiter().store_table_plan(plan_key, cached_policies);
-			}
 		}
-
-		let mut limits = ResourceLimits::default();
-		let mut any = false;
-		if let Some(scan) = scan {
-			limits = limits.with_limit(GovResourceKind::ScanKey, scan);
-			any = true;
-		}
-		if let Some(result) = result {
-			limits = limits.with_limit(GovResourceKind::ResultRow, result);
-			any = true;
-		}
-
-		Ok(any.then_some(limits))
-	}
-
-	async fn install_inline_ratelimit_budget(
-		&mut self,
-		kvs: &Datastore,
-		txn: Arc<Transaction>,
-		plan: &TopLevelExpr,
-		table_ratelimit_targets: Option<&TableRatelimitTargets>,
-	) -> FlowResult<()> {
-		let ctx = Arc::get_mut(&mut self.ctx).ok_or_else(|| {
-			anyhow::Error::new(Error::unreachable(
-				"Tried to update a Context resource budget with multiple references",
-			))
-		})?;
-		ctx.set_transaction(Arc::clone(&txn));
-
-		let budget = self
-			.inline_ratelimit_resource_limits(kvs, txn, table_ratelimit_targets)
-			.await?
-			.map(ResourceBudget::enforcing)
-			.map(Arc::new);
-		if let Some(budget) = budget.as_ref() {
-			budget.set_truncation_allowed(matches!(
-				plan,
-				TopLevelExpr::Use(_) | TopLevelExpr::Show(_) | TopLevelExpr::Expr(Expr::Select(_))
-			));
-		}
-
-		let ctx = Arc::get_mut(&mut self.ctx).ok_or_else(|| {
-			anyhow::Error::new(Error::unreachable(
-				"Tried to update a Context resource budget with multiple references",
-			))
-		})?;
-		ctx.set_resource_budget_opt(budget);
 		Ok(())
 	}
 
-	fn partial_reason_for_result(&self, is_error: bool) -> Option<PartialReason> {
-		let truncated = self.ctx.resource_budget().and_then(|budget| budget.take_truncated_kind());
-		if is_error {
-			return None;
-		}
-		match truncated {
-			Some(GovResourceKind::ScanKey) => Some(PartialReason::ScanLimit),
-			_ => None,
-		}
-	}
-
-	fn set_partial_truncation_allowed(&self, allowed: bool) {
-		if let Some(budget) = self.ctx.resource_budget() {
-			budget.set_truncation_allowed(allowed);
-		}
-	}
-
-	async fn refund_unused_scan_reservations(&mut self, kvs: &Datastore) {
-		let scanned = self
-			.ctx
-			.resource_budget()
-			.map(|budget| budget.usage().get(GovResourceKind::ScanKey))
-			.unwrap_or_default();
-		let reservations = std::mem::take(&mut self.scan_reservations);
-		for reservation in reservations {
-			let used = reservation.reserved.min(scanned);
-			let refund = reservation.reserved.saturating_sub(used);
-			if refund == 0 {
-				continue;
+	/// Build and install the scan meter for the statement about to run,
+	/// or clear any stale meter when the statement has no SELECT policies.
+	/// Fails closed: if a meter is needed but cannot be installed, the
+	/// statement is denied rather than executed unmetered.
+	fn install_scan_meter(&mut self, kvs: &Datastore) -> Result<()> {
+		self.scan_meter = None;
+		let meter = if self.meter_policies.is_empty() {
+			None
+		} else {
+			let session = kvs.ratelimit_charge_session(self.ctx.tenant_identity().cloned());
+			Some(Arc::new(crate::gov::ScanRatelimitMeter::new(
+				Arc::clone(self.ctx.rate_limiter()),
+				session,
+				std::mem::take(&mut self.meter_policies),
+			)))
+		};
+		let Some(ctx) = Arc::get_mut(&mut self.ctx) else {
+			if meter.is_some() {
+				bail!(Error::unreachable(
+					"scan rate-limit meter could not be installed: ctx Arc contended at statement boundary"
+				));
 			}
-			let txn = match kvs.transaction(TransactionType::Write, LockType::Optimistic).await {
-				Ok(txn) => txn.with_tenant_identity(self.ctx.tenant_identity().cloned()),
-				Err(error) => {
-					tracing::warn!(target: TARGET, %error, "failed to create scan quota refund transaction");
-					continue;
-				}
-			};
-			let refund_result = self
+			return Ok(());
+		};
+		ctx.set_scan_ratelimit_meter(meter.clone());
+		self.scan_meter = meter;
+		Ok(())
+	}
+
+	/// Settle the scan meter for the statement that just finished (or was
+	/// cancelled): refund the unused reservation and uninstall the meter.
+	async fn settle_scan_meter(&mut self) {
+		if let Some(meter) = self.scan_meter.take() {
+			meter.settle().await;
+			if let Some(ctx) = Arc::get_mut(&mut self.ctx) {
+				ctx.set_scan_ratelimit_meter(None);
+			}
+		}
+	}
+
+	/// Whether the statement that just finished has any rate-limit state to
+	/// settle. Checked before boxing the settlement future so statements on
+	/// tables without policies pay no allocation at all.
+	fn has_pending_ratelimit_state(&self) -> bool {
+		self.scan_meter.is_some()
+			|| !self.record_ratelimits.is_empty()
+			|| self
 				.ctx
-				.rate_limiter()
-				.refund_kv_hash(
-					&txn,
-					reservation.key_hash,
-					reservation.limit,
-					reservation.period,
-					refund,
-				)
-				.await;
-			let refund_result = match refund_result {
-				Ok(()) => txn.commit().await,
-				Err(error) => Err(error),
-			};
-			if let Err(error) = refund_result {
-				tracing::warn!(target: TARGET, %error, "failed to refund unused scan quota");
+				.ratelimit_charges()
+				.is_some_and(|acc| !acc.lock().unwrap_or_else(|e| e.into_inner()).is_empty())
+	}
+
+	/// Settle all rate-limit state for the statement that just finished:
+	/// refund the scan meter's unused reservation, then settle table- and
+	/// field-level charges. Callers box this future — it only does real
+	/// work when policies matched, and keeping it off the per-statement
+	/// state machine keeps deeply nested executions (signin subqueries,
+	/// nested transactions) within stack bounds.
+	async fn settle_statement_charges(&mut self, kvs: &Datastore, amount: u64) -> FlowResult<()> {
+		self.settle_scan_meter().await;
+		self.charge_record_ratelimits(kvs, amount).await
+	}
+
+	/// Settle every rate-limit charge for the statement that just finished:
+	/// each table-level policy charges `amount` (the statement's row count),
+	/// plus whatever field-level charges accumulated during document
+	/// processing.
+	///
+	/// Settlement runs in a dedicated transaction (inside
+	/// [`crate::gov::RateLimiter::charge`]), never the user's: bucket
+	/// contention cannot abort unrelated user work, and a settled charge
+	/// survives a later rollback of the statement's own transaction —
+	/// consumed resources are paid even when the work is discarded.
+	async fn charge_record_ratelimits(&mut self, kvs: &Datastore, amount: u64) -> FlowResult<()> {
+		let mut charges: Vec<PendingCharge> = Vec::new();
+		if amount > 0 {
+			charges.extend(self.record_ratelimits.drain(..).map(|policy| PendingCharge {
+				scope: format!("table {}", policy.table_name),
+				key: policy.key,
+				limit: policy.limit,
+				period: policy.period,
+				max: policy.max,
+				amount,
+			}));
+		} else {
+			self.record_ratelimits.clear();
+		}
+		if let Some(accumulator) = self.ctx.ratelimit_charges() {
+			let mut pending = accumulator.lock().unwrap_or_else(|e| e.into_inner());
+			// Aggregate identical buckets so a large write settles as one
+			// bucket update per distinct key. Equal keys imply equal policy
+			// parameters: the policy identity is part of the key material.
+			let mut index: HashMap<BucketKey, usize> =
+				charges.iter().enumerate().map(|(i, charge)| (charge.key, i)).collect();
+			for charge in pending.drain(..) {
+				match index.entry(charge.key) {
+					std::collections::hash_map::Entry::Occupied(entry) => {
+						charges[*entry.get()].amount += charge.amount;
+					}
+					std::collections::hash_map::Entry::Vacant(entry) => {
+						entry.insert(charges.len());
+						charges.push(charge);
+					}
+				}
 			}
+		}
+		if charges.is_empty() {
+			return Ok(());
+		}
+		let outcome = self
+			.ctx
+			.rate_limiter()
+			.charge(&kvs.ratelimit_charge_session(self.ctx.tenant_identity().cloned()), &charges)
+			.await?;
+		match outcome {
+			ChargeOutcome::Admitted => Ok(()),
+			ChargeOutcome::Denied {
+				scope,
+				retry_after,
+			} => Err(ControlFlow::Err(anyhow::Error::new(Error::RateLimitExceeded {
+				scope,
+				retry_after,
+			}))),
 		}
 	}
 
+	fn partial_reason_for_result(&self, _is_error: bool) -> Option<PartialReason> {
+		None
+	}
 	/// Install a per-statement notification broker when `writable` is true and the session has
 	/// notifications enabled. Read-only bare statements skip installation — they cannot emit
 	/// LIVE/KILL notifications — avoiding allocation and stale-broker leaks on the hot path.
@@ -636,7 +635,9 @@ impl Executor {
 			ctx,
 			cached_session: None,
 			broker_owned_by_executor: false,
-			scan_reservations: Vec::new(),
+			record_ratelimits: Vec::new(),
+			meter_policies: Vec::new(),
+			scan_meter: None,
 		}
 	}
 
@@ -662,6 +663,10 @@ impl Executor {
 		let counters = StatementCounters::new();
 		if let Some(ctx) = Arc::get_mut(&mut self.ctx) {
 			ctx.set_statement_counters(Some(Arc::clone(&counters)));
+			// Fresh per-statement accumulator for field-level RATELIMIT
+			// charges, settled alongside table-level charges after the
+			// statement completes.
+			ctx.set_ratelimit_charges(Some(Arc::new(std::sync::Mutex::new(Vec::new()))));
 		} else {
 			debug_assert!(
 				false,
@@ -1015,12 +1020,8 @@ impl Executor {
 		// Build the root context using cached session info. The context
 		// snapshot must be fresh per-query because it contains the
 		// transaction reference which changes between statements.
-		let mut ctx = Context::snapshot(&self.ctx);
-		if ctx.resource_budget().is_none() {
-			ctx.set_resource_budget(Arc::new(ResourceBudget::monitor(Default::default())));
-		}
 		let root_ctx = RootContext {
-			ctx: ctx.freeze(),
+			ctx: Context::snapshot(&self.ctx).freeze(),
 			options: Some(self.opt.clone()),
 			datastore: None,
 			cancellation,
@@ -1104,11 +1105,6 @@ impl Executor {
 		while let Some(batch_result) = stream.next().await {
 			match batch_result {
 				Ok(batch) => {
-					if let Some(budget) = exec_ctx.resource_budget() {
-						budget
-							.charge(GovResourceKind::ResultRow, batch.values.len() as u64)
-							.map_err(ControlFlow::Err)?;
-					}
 					results.extend(batch.values);
 				}
 				Err(crate::expr::ControlFlow::Err(e)) => {
@@ -1146,13 +1142,9 @@ impl Executor {
 		plan: TopLevelExpr,
 		table_ratelimit_targets: Option<&TableRatelimitTargets>,
 	) -> FlowResult<Value> {
-		if let Err(error) = self
-			.install_inline_ratelimit_budget(kvs, Arc::clone(&txn), &plan, table_ratelimit_targets)
-			.await
-		{
-			self.refund_unused_scan_reservations(kvs).await;
-			return Err(error);
-		}
+		let statement_type = StatementType::from_top_level(&plan);
+		self.collect_inline_ratelimit_policies(Arc::clone(&txn), table_ratelimit_targets).await?;
+		self.install_scan_meter(kvs)?;
 
 		/// Helper method to get mutable access to the context
 		macro_rules! ctx_mut {
@@ -1486,8 +1478,33 @@ impl Executor {
 			}
 			Err(error) => Err(ControlFlow::from(error)),
 		};
-		self.refund_unused_scan_reservations(kvs).await;
-		res
+
+		// Settle rate-limit charges for this statement regardless of its
+		// outcome: resources consumed by a failed or cancelled statement
+		// were still consumed, so failure must not make work free. This
+		// runs on every execution path (bare statements, explicit
+		// BEGIN/COMMIT blocks, streaming), so a transaction block cannot
+		// bypass rate limits. A denial only replaces the result when the
+		// statement itself succeeded — an already-failed statement keeps
+		// its original error.
+		let charged_rows = Self::count_result_rows(
+			statement_type,
+			self.ctx.statement_counters().map(|counters| counters.as_ref()),
+			match &res {
+				Ok(value) | Err(ControlFlow::Return(value)) => Some(value),
+				Err(_) => None,
+			},
+		);
+		if !self.has_pending_ratelimit_state() {
+			return res;
+		}
+		match Box::pin(self.settle_statement_charges(kvs, charged_rows)).await {
+			Ok(()) => res,
+			Err(charge_error) => match res {
+				Ok(_) | Err(ControlFlow::Return(_)) => Err(charge_error),
+				res @ Err(_) => res,
+			},
+		}
 	}
 
 	/// Execute a query not wrapped in a transaction block.
@@ -1532,6 +1549,7 @@ impl Executor {
 		plan: TopLevelExpr,
 		force_write: bool,
 	) -> Result<Value> {
+		let statement_type = StatementType::from_top_level(&plan);
 		let transaction_type = if force_write {
 			TransactionType::Write
 		} else if plan.read_only() {
@@ -1548,7 +1566,6 @@ impl Executor {
 			matches!(transaction_type, TransactionType::Write),
 			kvs.live_query_broker(),
 		);
-		let retry_plan = matches!(transaction_type, TransactionType::Read).then(|| plan.clone());
 		let table_ratelimit_targets = Self::table_ratelimit_target_names(&plan);
 
 		let exec_result = match kvs.transaction_timeout() {
@@ -1568,7 +1585,20 @@ impl Executor {
 					Ok(res) => res,
 					Err(_) => {
 						let _ = txn.cancel().await;
-						self.refund_unused_scan_reservations(kvs).await;
+						// The statement was cancelled mid-flight, so the
+						// settlement inside execute_plan_in_transaction
+						// never ran. Settle what the counters recorded:
+						// timed-out work was still performed and must not
+						// be free. A denial here is irrelevant — the
+						// statement already failed.
+						let rows = Self::count_result_rows(
+							statement_type,
+							self.ctx.statement_counters().map(|counters| counters.as_ref()),
+							None,
+						);
+						if self.has_pending_ratelimit_state() {
+							let _ = Box::pin(self.settle_statement_charges(kvs, rows)).await;
+						}
 						bail!(Error::TransactionTimedout(timeout.into()))
 					}
 				}
@@ -1615,11 +1645,6 @@ impl Executor {
 			}
 			Err(ControlFlow::Err(e)) => {
 				let _ = txn.cancel().await;
-				if let (true, Some(plan)) =
-					(e.downcast_ref::<RateLimitRequiresWrite>().is_some(), retry_plan)
-				{
-					return Box::pin(self.execute_plan_impl_inner(kvs, start, plan, true)).await;
-				}
 				Err(e)
 			}
 		}
@@ -2091,7 +2116,6 @@ impl Executor {
 					// surface affected-row counts independently of the
 					// post-RETURN value shape.
 					let counters = self.install_statement_counters();
-					self.set_partial_truncation_allowed(statement_read_only);
 					let execution = self
 						.execute_plan_in_transaction(
 							kvs,
@@ -2101,7 +2125,6 @@ impl Executor {
 							table_ratelimit_targets.as_ref(),
 						)
 						.await;
-					self.set_partial_truncation_allowed(false);
 					let r: Result<Value> = match execution {
 						Ok(x) => Ok(x),
 						Err(ControlFlow::Return(value)) => {
@@ -2292,7 +2315,6 @@ impl Executor {
 				);
 			let table_ratelimit_targets = Self::table_ratelimit_target_names(&expr);
 			let counters = executor.install_statement_counters();
-			executor.set_partial_truncation_allowed(statement_read_only);
 			let result = executor
 				.execute_plan_in_transaction(
 					kvs,
@@ -2302,7 +2324,6 @@ impl Executor {
 					table_ratelimit_targets.as_ref(),
 				)
 				.await;
-			executor.set_partial_truncation_allowed(false);
 
 			let time = start.elapsed();
 			let query_result = match result {
@@ -2572,9 +2593,7 @@ impl Executor {
 					// iterators can record affected rows independently of
 					// the post-RETURN value shape.
 					let counters = this.install_statement_counters();
-					this.set_partial_truncation_allowed(statement_read_only);
 					let result = this.execute_bare_statement(kvs, &start, stmt).await;
-					this.set_partial_truncation_allowed(false);
 					let outcome = Outcome::from(&result);
 					let result_rows = Self::count_result_rows(
 						statement_type,
@@ -2629,14 +2648,17 @@ impl Executor {
 
 #[cfg(test)]
 mod tests {
-	use crate::dbs::{PartialReason, Session};
+	use uuid::Uuid;
+
+	use crate::dbs::Session;
 	use crate::iam::{Level, Role};
 	use crate::kvs::Datastore;
 
 	#[tokio::test]
 	async fn inline_field_ratelimit_create_rejects_second_request_in_window() {
 		let ds = Datastore::new("memory").await.unwrap();
-		let sess = Session::owner().with_ns("NS").with_db("DB");
+		let mut sess = Session::owner().with_ns("NS").with_db("DB");
+		sess.id = Some(Uuid::new_v4());
 
 		ds.execute(
 			"DEFINE NAMESPACE NS; USE NS NS; DEFINE DATABASE DB; \
@@ -2660,7 +2682,8 @@ mod tests {
 	#[tokio::test]
 	async fn inline_field_ratelimit_update_uses_field_bucket() {
 		let ds = Datastore::new("memory").await.unwrap();
-		let sess = Session::owner().with_ns("NS").with_db("DB");
+		let mut sess = Session::owner().with_ns("NS").with_db("DB");
+		sess.id = Some(Uuid::new_v4());
 
 		ds.execute(
 			"DEFINE NAMESPACE NS; USE NS NS; DEFINE DATABASE DB; \
@@ -2716,7 +2739,8 @@ mod tests {
 	#[tokio::test]
 	async fn inline_field_ratelimit_where_false_does_not_apply() {
 		let ds = Datastore::new("memory").await.unwrap();
-		let sess = Session::owner().with_ns("NS").with_db("DB");
+		let mut sess = Session::owner().with_ns("NS").with_db("DB");
+		sess.id = Some(Uuid::new_v4());
 
 		ds.execute(
 			"DEFINE NAMESPACE NS; USE NS NS; DEFINE DATABASE DB; \
@@ -2741,7 +2765,8 @@ mod tests {
 	#[tokio::test]
 	async fn inline_table_ratelimit_admission_rejects_second_request_in_window() {
 		let ds = Datastore::new("memory").await.unwrap();
-		let sess = Session::owner().with_ns("NS").with_db("DB");
+		let mut sess = Session::owner().with_ns("NS").with_db("DB");
+		sess.id = Some(Uuid::new_v4());
 
 		ds.execute(
 			"DEFINE NAMESPACE NS; USE NS NS; DEFINE DATABASE DB; \
@@ -2755,7 +2780,6 @@ mod tests {
 
 		// This SELECT is read-only, but KV-backed admission mutates bucket state.
 		// It must transparently retry in a writable transaction instead of leaking
-		// the internal RateLimitRequiresWrite sentinel to the client.
 		ds.execute("SELECT * FROM person", &sess, None).await.unwrap()[0].result.as_ref().unwrap();
 		let res = ds.execute("SELECT * FROM person", &sess, None).await.unwrap();
 		let err = res[0].result.as_ref().unwrap_err().to_string();
@@ -2769,7 +2793,8 @@ mod tests {
 	#[tokio::test]
 	async fn inline_table_ratelimit_undefined_create_target_is_not_planning_error() {
 		let ds = Datastore::new("memory").await.unwrap();
-		let sess = Session::owner().with_ns("NS").with_db("DB");
+		let mut sess = Session::owner().with_ns("NS").with_db("DB");
+		sess.id = Some(Uuid::new_v4());
 
 		ds.execute("DEFINE NAMESPACE NS; USE NS NS; DEFINE DATABASE DB;", &sess, None)
 			.await
@@ -2782,7 +2807,8 @@ mod tests {
 	#[tokio::test]
 	async fn inline_table_ratelimit_cached_plan_skips_undefined_create_target() {
 		let ds = Datastore::new("memory").await.unwrap();
-		let sess = Session::owner().with_ns("NS").with_db("DB");
+		let mut sess = Session::owner().with_ns("NS").with_db("DB");
+		sess.id = Some(Uuid::new_v4());
 
 		ds.execute(
 			"DEFINE NAMESPACE NS; USE NS NS; DEFINE DATABASE DB; \
@@ -2806,7 +2832,8 @@ mod tests {
 	#[tokio::test]
 	async fn inline_table_ratelimit_limit_implies_initial_token_capacity() {
 		let ds = Datastore::new("memory").await.unwrap();
-		let sess = Session::owner().with_ns("NS").with_db("DB");
+		let mut sess = Session::owner().with_ns("NS").with_db("DB");
+		sess.id = Some(Uuid::new_v4());
 
 		ds.execute(
 			"DEFINE NAMESPACE NS; USE NS NS; DEFINE DATABASE DB; \
@@ -2857,7 +2884,8 @@ mod tests {
 	#[tokio::test]
 	async fn inline_table_ratelimit_where_false_does_not_apply() {
 		let ds = Datastore::new("memory").await.unwrap();
-		let sess = Session::owner().with_ns("NS").with_db("DB");
+		let mut sess = Session::owner().with_ns("NS").with_db("DB");
+		sess.id = Some(Uuid::new_v4());
 
 		ds.execute(
 			"DEFINE NAMESPACE NS; USE NS NS; DEFINE DATABASE DB; \
@@ -2874,29 +2902,72 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn inline_table_ratelimit_result_budget_errors_when_exceeded() {
+	async fn inline_table_ratelimit_multiple_select_policies_all_apply() {
 		let ds = Datastore::new("memory").await.unwrap();
-		let sess = Session::owner().with_ns("NS").with_db("DB");
+		let mut sess = Session::owner().with_ns("NS").with_db("DB").with_ac("A");
+		sess.id = Some(Uuid::new_v4());
 
 		ds.execute(
 			"DEFINE NAMESPACE NS; USE NS NS; DEFINE DATABASE DB; \
-			 DEFINE TABLE person RATELIMIT FOR SELECT BY $session.id LIMIT 100 PER 1s SCAN 100 PER 1h RESULT 1; \
-			 CREATE person:1; CREATE person:2;",
+			 DEFINE TABLE person RATELIMIT \
+				FOR SELECT BY $session.id LIMIT 2 PER 1h, \
+				FOR SELECT BY $session.ac LIMIT 1 PER 1h; \
+			 CREATE person:1;",
 			&sess,
 			None,
 		)
 		.await
 		.unwrap();
 
+		ds.execute("SELECT * FROM person", &sess, None).await.unwrap()[0].result.as_ref().unwrap();
 		let res = ds.execute("SELECT * FROM person", &sess, None).await.unwrap();
 		let err = res[0].result.as_ref().unwrap_err().to_string();
-		assert!(err.contains("result rows"), "expected result row budget error, got: {err}");
+		assert!(
+			err.contains("rate limit"),
+			"expected second applicable policy to reject, got: {err}"
+		);
+	}
+
+	#[tokio::test]
+	async fn inline_table_ratelimit_multiple_cached_select_policies_all_apply() {
+		let ds = Datastore::new("memory").await.unwrap();
+		let mut sess_a = Session::owner().with_ns("NS").with_db("DB").with_ac("A");
+		let mut sess_b = Session::owner().with_ns("NS").with_db("DB").with_ac("B");
+		sess_a.id = Some(Uuid::new_v4());
+		sess_b.id = Some(Uuid::new_v4());
+
+		ds.execute(
+			"DEFINE NAMESPACE NS; USE NS NS; DEFINE DATABASE DB; \
+			 DEFINE TABLE person RATELIMIT \
+				FOR SELECT BY $session.id LIMIT 1 PER 1h, \
+				FOR SELECT BY $session.ac LIMIT 1 PER 1h; \
+			 CREATE person:1;",
+			&sess_a,
+			None,
+		)
+		.await
+		.unwrap();
+
+		ds.execute("SELECT * FROM person", &sess_a, None).await.unwrap()[0]
+			.result
+			.as_ref()
+			.unwrap();
+		ds.execute("SELECT * FROM person", &sess_b, None).await.unwrap()[0]
+			.result
+			.as_ref()
+			.unwrap();
+
+		let res = ds.execute("SELECT * FROM person", &sess_a, None).await.unwrap();
+		assert!(res[0].result.as_ref().unwrap_err().to_string().contains("rate limit"));
+		let res = ds.execute("SELECT * FROM person", &sess_b, None).await.unwrap();
+		assert!(res[0].result.as_ref().unwrap_err().to_string().contains("rate limit"));
 	}
 
 	#[tokio::test]
 	async fn inline_table_ratelimit_applies_to_record_id_targets() {
 		let ds = Datastore::new("memory").await.unwrap();
-		let sess = Session::owner().with_ns("NS").with_db("DB");
+		let mut sess = Session::owner().with_ns("NS").with_db("DB");
+		sess.id = Some(Uuid::new_v4());
 
 		ds.execute(
 			"DEFINE NAMESPACE NS; USE NS NS; DEFINE DATABASE DB; \
@@ -2919,7 +2990,8 @@ mod tests {
 	#[tokio::test]
 	async fn inline_table_ratelimit_applies_to_insert_targets() {
 		let ds = Datastore::new("memory").await.unwrap();
-		let sess = Session::owner().with_ns("NS").with_db("DB");
+		let mut sess = Session::owner().with_ns("NS").with_db("DB");
+		sess.id = Some(Uuid::new_v4());
 
 		ds.execute(
 			"DEFINE NAMESPACE NS; USE NS NS; DEFINE DATABASE DB; \
@@ -2939,14 +3011,38 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn inline_table_ratelimit_scan_budget_returns_partial_batch() {
+	async fn inline_table_ratelimit_max_allows_burst_above_refill_limit() {
 		let ds = Datastore::new("memory").await.unwrap();
+		let mut sess = Session::owner().with_ns("NS").with_db("DB");
+		sess.id = Some(Uuid::new_v4());
+
+		ds.execute(
+			"DEFINE NAMESPACE NS; USE NS NS; DEFINE DATABASE DB; \
+			 DEFINE TABLE person RATELIMIT FOR SELECT BY $session.id LIMIT 1 PER 1h MAX 2; \
+			 CREATE person:1;",
+			&sess,
+			None,
+		)
+		.await
+		.unwrap();
+
+		ds.execute("SELECT * FROM person", &sess, None).await.unwrap()[0].result.as_ref().unwrap();
+		ds.execute("SELECT * FROM person", &sess, None).await.unwrap()[0].result.as_ref().unwrap();
+		let res = ds.execute("SELECT * FROM person", &sess, None).await.unwrap();
+		assert!(res[0].result.as_ref().unwrap_err().to_string().contains("rate limit"));
+	}
+
+	#[tokio::test]
+	async fn inline_table_ratelimit_none_key_fails_closed() {
+		let ds = Datastore::new("memory").await.unwrap();
+		// No session id: the BY key is unavailable. The statement must be
+		// denied rather than merging into a shared NONE bucket.
 		let sess = Session::owner().with_ns("NS").with_db("DB");
 
 		ds.execute(
 			"DEFINE NAMESPACE NS; USE NS NS; DEFINE DATABASE DB; \
-			 DEFINE TABLE person RATELIMIT FOR SELECT BY $session.id LIMIT 100 PER 1s SCAN 2 PER 1h; \
-			 CREATE person:1; CREATE person:2; CREATE person:3;",
+			 DEFINE TABLE person RATELIMIT FOR SELECT BY $session.id LIMIT 100 PER 1h; \
+			 CREATE person:1;",
 			&sess,
 			None,
 		)
@@ -2954,96 +3050,147 @@ mod tests {
 		.unwrap();
 
 		let res = ds.execute("SELECT * FROM person", &sess, None).await.unwrap();
-		let rows = res[0].result.as_ref().unwrap().as_array().unwrap();
-		assert_eq!(rows.len(), 2);
-		assert_eq!(res[0].partial, Some(PartialReason::ScanLimit));
+		let err = res[0].result.as_ref().unwrap_err().to_string();
+		assert!(err.contains("evaluated to NONE"), "expected fail-closed error, got: {err}");
 	}
 
 	#[tokio::test]
-	async fn inline_table_ratelimit_grouped_scan_budget_is_cumulative_per_period() {
+	async fn inline_table_ratelimit_none_key_guarded_by_where_is_exempt() {
 		let ds = Datastore::new("memory").await.unwrap();
+		// The intended idiom: guard a nullable key with a WHERE clause so
+		// the policy simply does not apply when the key is absent.
 		let sess = Session::owner().with_ns("NS").with_db("DB");
 
 		ds.execute(
 			"DEFINE NAMESPACE NS; USE NS NS; DEFINE DATABASE DB; \
-			 DEFINE TABLE person; \
-			 CREATE person:1; CREATE person:2; CREATE person:3; \
-			 DEFINE TABLE OVERWRITE person RATELIMIT FOR SELECT BY $session.id LIMIT 100 PER 1s, FOR SCAN 2 PER 1h;",
+			 DEFINE TABLE person RATELIMIT FOR SELECT WHERE $session.id != NONE BY $session.id LIMIT 1 PER 1h; \
+			 CREATE person:1;",
 			&sess,
 			None,
 		)
 		.await
 		.unwrap();
 
-		let res = ds.execute("SELECT * FROM person", &sess, None).await.unwrap();
-		let rows = res[0].result.as_ref().unwrap().as_array().unwrap();
-		assert_eq!(rows.len(), 2);
-		assert_eq!(res[0].partial, Some(PartialReason::ScanLimit));
-
-		let res = ds.execute("SELECT * FROM person", &sess, None).await.unwrap();
-		let rows = res[0].result.as_ref().unwrap().as_array().unwrap();
-		assert_eq!(rows.len(), 0);
-		assert_eq!(res[0].partial, Some(PartialReason::ScanLimit));
+		ds.execute("SELECT * FROM person", &sess, None).await.unwrap()[0].result.as_ref().unwrap();
+		ds.execute("SELECT * FROM person", &sess, None).await.unwrap()[0].result.as_ref().unwrap();
 	}
 
 	#[tokio::test]
-	async fn inline_table_ratelimit_overlapping_scan_quotas_charge_each_policy() {
-		let ds = Datastore::new("memory").await.unwrap();
-		let sess_a = Session::owner().with_ns("NS").with_db("DB").with_ac("A");
-		let sess_b = Session::owner().with_ns("NS").with_db("DB").with_ac("B");
-
-		ds.execute(
-			"DEFINE NAMESPACE NS; USE NS NS; DEFINE DATABASE DB; \
-			 DEFINE TABLE person; \
-			 CREATE person:1; CREATE person:2; CREATE person:3; \
-			 DEFINE TABLE OVERWRITE person RATELIMIT \
-				FOR SELECT BY $session.ac LIMIT 100 PER 1s SCAN 2 PER 1h, \
-				FOR SCAN 2 PER 1h;",
-			&sess_a,
-			None,
-		)
-		.await
-		.unwrap();
-
-		let res = ds.execute("SELECT * FROM person", &sess_a, None).await.unwrap();
-		let rows = res[0].result.as_ref().unwrap().as_array().unwrap();
-		assert_eq!(rows.len(), 2);
-		assert_eq!(res[0].partial, Some(PartialReason::ScanLimit));
-
-		let res = ds.execute("SELECT * FROM person", &sess_b, None).await.unwrap();
-		let rows = res[0].result.as_ref().unwrap().as_array().unwrap();
-		assert_eq!(rows.len(), 0);
-		assert_eq!(res[0].partial, Some(PartialReason::ScanLimit));
-	}
-
-	#[tokio::test]
-	async fn inline_table_ratelimit_failed_mutation_still_consumes_scan_quota() {
+	async fn inline_field_ratelimit_none_key_fails_closed() {
 		let ds = Datastore::new("memory").await.unwrap();
 		let sess = Session::owner().with_ns("NS").with_db("DB");
 
 		ds.execute(
 			"DEFINE NAMESPACE NS; USE NS NS; DEFINE DATABASE DB; \
 			 DEFINE TABLE person SCHEMAFULL; \
-			 DEFINE FIELD age ON person TYPE int ASSERT $value > 0; \
-			 CREATE person:1 SET age = 1; CREATE person:2 SET age = 2; \
-			 DEFINE TABLE OVERWRITE person SCHEMAFULL RATELIMIT FOR SCAN 1 PER 1h; \
-			 DEFINE FIELD OVERWRITE age ON person TYPE int ASSERT $value > 0;",
+			 DEFINE FIELD name ON person TYPE string RATELIMIT FOR CREATE BY $session.id LIMIT 100 PER 1h;",
 			&sess,
 			None,
 		)
 		.await
 		.unwrap();
 
-		let res = ds.execute("UPDATE person SET age = -1", &sess, None).await.unwrap();
+		let res = ds.execute("CREATE person:1 SET name = 'one'", &sess, None).await.unwrap();
 		let err = res[0].result.as_ref().unwrap_err().to_string();
-		assert!(err.contains("field must conform"), "expected assertion error, got: {err}");
+		assert!(err.contains("evaluated to NONE"), "expected fail-closed error, got: {err}");
+	}
 
-		let res = ds.execute("UPDATE person SET age = -1", &sess, None).await.unwrap();
+	#[tokio::test]
+	async fn inline_table_ratelimit_applies_inside_transaction_block() {
+		let ds = Datastore::new("memory").await.unwrap();
+		let mut sess = Session::owner().with_ns("NS").with_db("DB");
+		sess.id = Some(Uuid::new_v4());
+
+		ds.execute(
+			"DEFINE NAMESPACE NS; USE NS NS; DEFINE DATABASE DB; \
+			 DEFINE TABLE person RATELIMIT FOR SELECT BY $session.id LIMIT 1 PER 1h; \
+			 CREATE person:1;",
+			&sess,
+			None,
+		)
+		.await
+		.unwrap();
+
+		// Wrapping statements in BEGIN/COMMIT must not bypass rate limits.
+		let res = ds
+			.execute("BEGIN; SELECT * FROM person; SELECT * FROM person; COMMIT;", &sess, None)
+			.await
+			.unwrap();
+		let errors: Vec<String> =
+			res.iter().filter_map(|r| r.result.as_ref().err().map(|e| e.to_string())).collect();
+		assert!(
+			errors.iter().any(|err| err.contains("rate limit")),
+			"expected a rate limit denial inside the transaction block, got: {res:?}"
+		);
+	}
+
+	#[tokio::test]
+	async fn inline_table_ratelimit_charges_failed_statements() {
+		let ds = Datastore::new("memory").await.unwrap();
+		let mut sess = Session::owner().with_ns("NS").with_db("DB");
+		sess.id = Some(Uuid::new_v4());
+
+		// The `zz_` prefix keeps the asserting field ordered after the
+		// ratelimited one, so the charge is incurred before the ASSERT
+		// fails the statement.
+		ds.execute(
+			"DEFINE NAMESPACE NS; USE NS NS; DEFINE DATABASE DB; \
+			 DEFINE TABLE person SCHEMAFULL; \
+			 DEFINE FIELD name ON person TYPE string RATELIMIT FOR CREATE BY $session.id LIMIT 1 PER 1h; \
+			 DEFINE FIELD zz_flag ON person TYPE string ASSERT $value != 'bad';",
+			&sess,
+			None,
+		)
+		.await
+		.unwrap();
+
+		// The first CREATE fails validation *after* the ratelimited field
+		// was processed. The field-level charge was already incurred and
+		// settles in the dedicated charge transaction: work performed by a
+		// failed statement is still work, and the rollback of the user's
+		// transaction does not refund it.
+		let res = ds
+			.execute("CREATE person:1 SET name = 'x', zz_flag = 'bad'", &sess, None)
+			.await
+			.unwrap();
+		assert!(res[0].result.is_err(), "assert should have failed the create");
+		let res = ds
+			.execute("CREATE person:2 SET name = 'y', zz_flag = 'ok'", &sess, None)
+			.await
+			.unwrap();
 		let err = res[0].result.as_ref().unwrap_err().to_string();
 		assert!(
-			err.contains("scan keys resource budget"),
-			"expected consumed scan quota to reject the second mutation, got: {err}"
+			err.contains("rate limit"),
+			"failed statement should still have consumed the budget, got: {err}"
 		);
+	}
+
+	#[tokio::test]
+	async fn inline_table_ratelimit_meters_scanned_rows_not_returned_rows() {
+		let ds = Datastore::new("memory").await.unwrap();
+		let mut sess = Session::owner().with_ns("NS").with_db("DB");
+		sess.id = Some(Uuid::new_v4());
+
+		ds.execute(
+			"DEFINE NAMESPACE NS; USE NS NS; DEFINE DATABASE DB; \
+			 DEFINE TABLE person RATELIMIT FOR SELECT BY $session.id LIMIT 2 PER 1h; \
+			 CREATE person:1; CREATE person:2; CREATE person:3; CREATE person:4; CREATE person:5;",
+			&sess,
+			None,
+		)
+		.await
+		.unwrap();
+
+		// The filter returns zero rows, but the scan still reads five —
+		// more than the bucket capacity. Metering rows scanned (not
+		// returned) means a selective filter cannot hide an expensive
+		// scan: the statement must be denied mid-flight.
+		let res = ds
+			.execute("SELECT * FROM person WHERE name = 'no-such-row'", &sess, None)
+			.await
+			.unwrap();
+		let err = res[0].result.as_ref().unwrap_err().to_string();
+		assert!(err.contains("rate limit"), "expected scan-metered denial, got: {err}");
 	}
 
 	#[tokio::test]

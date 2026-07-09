@@ -314,6 +314,15 @@ impl ExecOperator for GraphEdgeScan {
 										if batch.is_empty() {
 											break;
 										}
+										// Meter scanned adjacency keys against the
+										// statement's SELECT rate limits: edge
+										// enumeration is a storage read even when
+										// the embedded target vertex lets us skip
+										// the edge-record fetch, so it must not
+										// be free.
+										if let Some(meter) = ctx.ctx().scan_ratelimit_meter() {
+											meter.consume(batch.len() as u64).await?;
+										}
 										for key in &batch {
 											let decoded = decode_graph_edge(key)?;
 											if output_mode == GraphScanOutput::TargetVertex {
@@ -453,6 +462,15 @@ impl ExecOperator for GraphEdgeScan {
 													)?;
 												if inner_batch.is_empty() {
 													break;
+												}
+												// Meter the fallback adjacency walk
+												// like the main edge scan above.
+												if let Some(meter) =
+													ctx.ctx().scan_ratelimit_meter()
+												{
+													meter
+														.consume(inner_batch.len() as u64)
+														.await?;
 												}
 												for ik in &inner_batch {
 													// On edge-side adjacency keys the

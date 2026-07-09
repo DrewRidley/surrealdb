@@ -6,8 +6,6 @@ use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use surrealdb_core::dbs::PartialReason;
-
 use crate::opt::auth::{Credentials, Token};
 use crate::opt::{IntoEndpoint, IntoExportDestination, WaitFor, auth};
 use crate::types::{SurrealValue, Value, Variables};
@@ -108,8 +106,8 @@ pub struct Relation;
 pub struct Stats {
 	/// The time taken to execute the query
 	pub execution_time: Option<Duration>,
-	/// The reason a successful query response is partial, if it was truncated.
-	pub partial_reason: Option<PartialReason>,
+	/// The reason the result is partial, if the server truncated it.
+	pub partial_reason: Option<crate::PartialReason>,
 }
 
 /// Wraps the [`Query`] output from [`Query::with_stats`](crate::method::Query::with_stats) so each

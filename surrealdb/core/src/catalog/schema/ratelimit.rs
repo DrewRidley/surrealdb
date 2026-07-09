@@ -9,7 +9,7 @@ use crate::expr::statements::info::InfoStructure;
 use crate::types::PublicDuration;
 use crate::val::Value;
 
-#[revisioned(revision = 2)]
+#[revisioned(revision = 3)]
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct RateLimit {
 	pub(crate) actions: Vec<PermissionKind>,
@@ -17,10 +17,8 @@ pub struct RateLimit {
 	pub(crate) bucket: Expr,
 	pub(crate) limit: u64,
 	pub(crate) period: Duration,
-	pub(crate) scan: Option<u64>,
-	#[revision(start = 2)]
-	pub(crate) scan_period: Option<Duration>,
-	pub(crate) result: Option<u64>,
+	#[revision(start = 3)]
+	pub(crate) max: Option<u64>,
 }
 
 pub(crate) type RateLimits = Vec<RateLimit>;
@@ -33,9 +31,7 @@ impl RateLimit {
 			bucket: self.bucket.clone().into(),
 			limit: self.limit,
 			period: PublicDuration::from_std(self.period),
-			scan: self.scan,
-			scan_period: self.scan_period.map(PublicDuration::from_std),
-			result: self.result,
+			max: self.max,
 		}
 	}
 }
@@ -54,9 +50,7 @@ impl InfoStructure for RateLimit {
 			"by" => self.bucket.structure(),
 			"limit" => self.limit.into(),
 			"period" => Value::Duration(self.period.into()),
-			"scan", if let Some(v) = self.scan => v.into(),
-			"scan_period", if let Some(v) = self.scan_period => Value::Duration(v.into()),
-			"result", if let Some(v) = self.result => v.into(),
+			"max", if let Some(v) = self.max => v.into(),
 		})
 	}
 }
@@ -69,9 +63,7 @@ impl From<crate::sql::RateLimit> for RateLimit {
 			bucket: v.bucket.into(),
 			limit: v.limit,
 			period: v.period.into_inner(),
-			scan: v.scan,
-			scan_period: v.scan_period.map(|v| v.into_inner()),
-			result: v.result,
+			max: v.max,
 		}
 	}
 }

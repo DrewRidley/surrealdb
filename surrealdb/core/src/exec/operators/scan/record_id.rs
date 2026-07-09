@@ -342,6 +342,7 @@ pub(crate) async fn execute_record_lookup(
 				pre_skip,
 				limit_hint,
 				pre_decode_filter,
+				ctx.ctx().scan_ratelimit_meter().cloned(),
 			);
 
 			let mut pipeline = ScanPipeline::new(

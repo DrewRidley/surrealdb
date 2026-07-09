@@ -752,6 +752,7 @@ async fn resolve_table_scan_stream(
 				cfg.pre_skip,
 				cfg.limit_hint,
 				cfg.pre_decode_filter.clone(),
+				ctx.ctx().scan_ratelimit_meter().cloned(),
 			);
 			Ok((stream, cfg.pre_skip))
 		}

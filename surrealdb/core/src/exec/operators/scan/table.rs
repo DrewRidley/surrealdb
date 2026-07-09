@@ -9,7 +9,7 @@ use std::sync::Arc;
 use futures::StreamExt;
 use tracing::instrument;
 
-use super::common::{charge_scanned_batch, resolve_version_stamp};
+use super::common::resolve_version_stamp;
 use super::pipeline::{ScanPipeline, build_field_state, eval_limit_expr, kv_scan_stream};
 use super::resolved::ResolvedTableContext;
 use crate::exec::permission::{
@@ -22,7 +22,6 @@ use crate::exec::{
 	OutputOrdering, PhysicalExpr, ValueBatch, ValueBatchStream, monitor_stream,
 };
 use crate::expr::{ControlFlow, ControlFlowExt};
-use crate::gov::ChargeOutcome;
 use crate::iam::Action;
 use crate::idx::planner::ScanDirection;
 use crate::key::record;
@@ -258,6 +257,7 @@ impl ExecOperator for TableScan {
 				Arc::clone(&txn), beg, end, version,
 				effective_storage_limit, direction, pre_skip, limit_hint,
 				pre_decode_filter,
+				ctx.ctx().scan_ratelimit_meter().cloned(),
 			);
 
 			let mut pipeline = ScanPipeline::new(
@@ -272,23 +272,9 @@ impl ExecOperator for TableScan {
 					))?;
 				}
 				let mut batch = batch_result?;
-				let charge = match charge_scanned_batch(ctx.resource_budget(), batch.values.len()) {
-					Ok(outcome) => outcome,
-					Err(e) => Err(ControlFlow::Err(e))?,
-				};
-				let truncated = match charge {
-					ChargeOutcome::Charged => false,
-					ChargeOutcome::Truncated(_, allowed) => {
-						batch.values.truncate(allowed as usize);
-						true
-					}
-				};
 				let cont = pipeline.process_batch(&mut batch.values, &ctx).await?;
 				if !batch.values.is_empty() {
 					yield ValueBatch { values: batch.values };
-				}
-				if truncated {
-					break;
 				}
 				if !cont {
 					break;

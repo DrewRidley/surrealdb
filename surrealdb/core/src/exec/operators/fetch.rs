@@ -267,6 +267,13 @@ pub(crate) async fn fetch_raw_record(
 		return Ok(None);
 	}
 
+	// Meter the fetched record against the statement's SELECT rate limits.
+	// This is the shared point-fetch choke point (record targets, FETCH
+	// clauses), so every plan shape pays the same cost per record read.
+	if let Some(meter) = ctx.ctx().scan_ratelimit_meter() {
+		meter.consume(1).await?;
+	}
+
 	Ok(Some(record.data.clone()))
 }
 

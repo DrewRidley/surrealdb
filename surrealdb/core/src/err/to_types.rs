@@ -129,7 +129,17 @@ pub fn into_types_error(error: Error) -> TypesError {
 			},
 		),
 		QueryCancelled => TypesError::query(message, QueryError::Cancelled),
-		QueryResourceExceeded {
+		RateLimitExceeded {
+			scope,
+			retry_after,
+		} => TypesError::query(
+			message,
+			QueryError::RateLimited {
+				scope,
+				retry_after,
+			},
+		),
+		RateLimitKeyUnavailable {
 			..
 		} => TypesError::query(message, None),
 		QueryNotExecuted {

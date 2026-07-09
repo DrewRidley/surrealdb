@@ -22,6 +22,10 @@ use crate::kvs::Transaction;
 use crate::types::{PublicAction, PublicNotification};
 use crate::val::{Value, convert_value_to_public_value};
 
+fn live_error_aborts_statement(e: &anyhow::Error) -> bool {
+	matches!(e.downcast_ref::<Error>(), Some(Error::RateLimitExceeded { .. }))
+}
+
 impl Document {
 	/// Processes any LIVE SELECT statements which
 	/// have been defined for the table which this
@@ -228,6 +232,9 @@ impl Document {
 		match self.lq_check(stk, &ctx, &opt, &live_subscription, &doc).await {
 			Err(IgnoreError::Ignore) => return Ok(()),
 			Err(IgnoreError::Error(e)) => {
+				if live_error_aborts_statement(&e) {
+					return Err(e);
+				}
 				tracing::debug!(
 					target: "surrealdb::core::doc::lives",
 					subscription_id = %live_subscription.id,
@@ -245,6 +252,9 @@ impl Document {
 		match self.lq_allow(stk, &ctx, &opt, is_delete).await {
 			Err(IgnoreError::Ignore) => return Ok(()),
 			Err(IgnoreError::Error(e)) => {
+				if live_error_aborts_statement(&e) {
+					return Err(e);
+				}
 				tracing::debug!(
 					target: "surrealdb::core::doc::lives",
 					subscription_id = %live_subscription.id,
@@ -317,6 +327,9 @@ impl Document {
 					match x.compute(stk, &ctx, &opt, Some(&doc)).await.map_err(IgnoreError::from) {
 						Err(IgnoreError::Ignore) => return Ok(()),
 						Err(IgnoreError::Error(e)) => {
+							if live_error_aborts_statement(&e) {
+								return Err(e);
+							}
 							tracing::debug!(
 								target: "surrealdb::core::doc::lives",
 								subscription_id = %live_subscription.id,
@@ -346,6 +359,9 @@ impl Document {
 			let mut idioms = BTreeSet::new();
 			for fetch in fetchs.iter() {
 				if let Err(e) = fetch.compute(stk, &ctx, &opt, &mut idioms).await {
+					if live_error_aborts_statement(&e) {
+						return Err(e);
+					}
 					tracing::debug!(
 						target: "surrealdb::core::doc::lives",
 						subscription_id = %live_subscription.id,
@@ -357,6 +373,9 @@ impl Document {
 			}
 			for i in &idioms {
 				if let Err(e) = stk.run(|stk| result.fetch(stk, &ctx, &opt, &i.0)).await {
+					if live_error_aborts_statement(&e) {
+						return Err(e);
+					}
 					tracing::debug!(
 						target: "surrealdb::core::doc::lives",
 						subscription_id = %live_subscription.id,
@@ -685,11 +704,6 @@ mod tests {
 		);
 	}
 
-	/// SECURITY: a LIVE query whose originating session has expired via TTL
-	/// must not receive notifications after the TTL passes. We set `exp` to
-	/// the current integer second so the session is technically still valid
-	/// at registration time, then sleep ≥1.1s so the integer second counter
-	/// has advanced past `exp`.
 	#[tokio::test]
 	async fn test_live_expired_session_suppresses_notification() {
 		let (recv, ds) = new_ds_with_broker().await.unwrap();

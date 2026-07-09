@@ -140,6 +140,21 @@ pub fn table_basic() -> TableDefinition {
 	}
 }
 
+/// Table with a RATELIMIT policy (added in the 3.2.0 wire format)
+pub fn table_with_ratelimit() -> TableDefinition {
+	TableDefinition {
+		ratelimits: vec![crate::catalog::RateLimit {
+			actions: vec![PermissionKind::Select],
+			condition: Some(Expr::Literal(Literal::Bool(true))),
+			bucket: Expr::Literal(Literal::String(Strand::new_static("$session.ip"))),
+			limit: 100,
+			period: Duration::from_secs(60),
+			max: Some(200),
+		}],
+		..table_basic()
+	}
+}
+
 /// Table with view definition
 pub fn table_with_view() -> TableDefinition {
 	TableDefinition {

@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::hash::Hash;
 use std::sync::Arc;
 
 use anyhow::{Result, bail, ensure};
@@ -14,6 +15,7 @@ use crate::expr::FlowResultExt as _;
 use crate::expr::data::Data;
 use crate::expr::idiom::{Idiom, IdiomTrie, IdiomTrieContains};
 use crate::expr::kind::{Kind, KindLiteral};
+use crate::gov::{BucketKeyHasher, PendingCharge};
 use crate::iam::{Action, AuthLimit};
 use crate::val::value::CoerceError;
 use crate::val::value::every::ArrayBehaviour;
@@ -342,8 +344,13 @@ impl Document {
 						val = field.process_assert_clause(val).await?;
 					}
 				}
-				// Process any RATELIMIT clause
-				field.process_ratelimit_clause(&val).await?;
+				// Process any RATELIMIT clause. Boxed so the charge chain
+				// does not inflate the per-record document future (copied
+				// onto the reblessive task stack per record); the
+				// allocation only happens for fields that define policies.
+				if !field.def.ratelimits.is_empty() {
+					Box::pin(field.process_ratelimit_clause(&val)).await?;
+				}
 				// Process any PERMISSIONS clause
 				val = field.process_permissions_clause(val).await?;
 				// Skip this field?
@@ -557,27 +564,43 @@ impl FieldEditContext<'_> {
 				.run(|stk| policy.bucket.compute(stk, &ctx, opt, doc))
 				.await
 				.catch_return()?;
-			let key = format!(
-				"{}:{}:{}:{}:{:?}:{}:{}",
-				self.opt.ns()?,
-				self.opt.db()?,
-				self.rid.table,
-				self.def.name.to_sql(),
-				action,
-				policy_index,
-				bucket.to_sql(),
-			);
 			self.context = Some(Context::unfreeze(ctx)?);
-			if !self
-				.ctx
-				.rate_limiter()
-				.admit_kv(&self.ctx.tx(), key, policy.limit, policy.period)
-				.await?
-			{
-				bail!(Error::RateLimitExceeded {
-					scope: format!("field {}", self.def.name.to_sql()),
+			let scope = format!("field {} on {}", self.def.name.to_sql(), self.rid.table);
+			// Fail closed: a NONE key would merge every key-less record
+			// write into one shared bucket, voiding the policy.
+			if bucket.is_nullish() {
+				bail!(Error::RateLimitKeyUnavailable {
+					scope,
 				});
 			}
+			// Persistence format: this byte sequence addresses bucket state
+			// in the datastore and must never change (see BucketKeyHasher).
+			let mut key = BucketKeyHasher::new();
+			self.opt.ns()?.hash(&mut key);
+			self.opt.db()?.hash(&mut key);
+			self.rid.table.hash(&mut key);
+			self.def.name.to_sql().hash(&mut key);
+			action.as_str().hash(&mut key);
+			policy_index.hash(&mut key);
+			bucket.hash(&mut key);
+			// Charges settle in the executor's dedicated charge transaction
+			// after the statement completes, never in the user's
+			// transaction: bucket contention cannot abort user work, and a
+			// settled charge survives a rollback of the statement itself.
+			let Some(accumulator) = self.ctx.ratelimit_charges() else {
+				// Fail closed: an unsettleable charge would make this write
+				// invisible to the policy.
+				debug_assert!(false, "field RATELIMIT charge with no accumulator installed");
+				bail!(Error::unreachable("field RATELIMIT charge with no accumulator installed"));
+			};
+			accumulator.lock().unwrap_or_else(|e| e.into_inner()).push(PendingCharge {
+				scope,
+				key: key.finalize(),
+				limit: policy.limit,
+				period: policy.period,
+				max: policy.max,
+				amount: 1,
+			});
 		}
 
 		Ok(())

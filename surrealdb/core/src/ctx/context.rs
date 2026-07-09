@@ -42,7 +42,7 @@ use crate::dbs::{
 use crate::err::Error;
 use crate::exec::function::FunctionRegistry;
 use crate::expr::Base;
-use crate::gov::{RateLimiter, ResourceBudget};
+use crate::gov::RateLimiter;
 #[cfg(feature = "http")]
 use crate::http::HttpClient;
 use crate::iam::{Action, ResourceKind};
@@ -127,6 +127,17 @@ pub struct Context {
 	// the corresponding `StatementEvent`. Replaced by the executor before
 	// each top-level statement; `None` outside an active statement.
 	statement_counters: Option<Arc<StatementCounters>>,
+	// Per-statement accumulator for rate-limit charges incurred during
+	// document processing (field-level RATELIMIT clauses). Installed by the
+	// executor before each top-level statement and settled in a dedicated
+	// charge transaction after the statement completes; `None` outside an
+	// active statement.
+	ratelimit_charges: Option<Arc<std::sync::Mutex<Vec<crate::gov::PendingCharge>>>>,
+	// Per-statement reservation-ahead meter for rows scanned under
+	// table-level RATELIMIT policies. Installed by the executor before a
+	// statement with SELECT policies executes; consulted from the scan
+	// paths of both execution engines.
+	scan_ratelimit_meter: Option<Arc<crate::gov::ScanRatelimitMeter>>,
 	// Pre-resolved tenant identity (namespace, database, user, session id,
 	// client ip) derived from the active session at `attach_session` time.
 	// Read by the executor and the transaction layer to populate the
@@ -135,8 +146,6 @@ pub struct Context {
 	tenant_identity: Option<Arc<crate::observe::TenantIdentity>>,
 	// Matches context for index functions (search::highlight, search::score, etc.)
 	matches_context: Option<Arc<crate::exec::function::MatchesContext>>,
-	// Shared resource budget and usage counters for this query/request.
-	resource_budget: Option<Arc<ResourceBudget>>,
 	// Shared admission limiter for schema-defined rate limits.
 	rate_limiter: Arc<RateLimiter>,
 	// KNN context for index functions (vector::distance::knn)
@@ -201,8 +210,9 @@ impl Context {
 			new_planner_strategy: NewPlannerStrategy::default(),
 			redact_volatile_explain_attrs: false,
 			statement_counters: None,
+			ratelimit_charges: None,
+			scan_ratelimit_meter: None,
 			matches_context: None,
-			resource_budget: parent.resource_budget.clone(),
 			rate_limiter: Arc::clone(&parent.rate_limiter),
 			knn_context: None,
 			config: Arc::clone(&parent.config),
@@ -261,8 +271,9 @@ impl Context {
 			new_planner_strategy: parent.new_planner_strategy,
 			redact_volatile_explain_attrs: parent.redact_volatile_explain_attrs,
 			statement_counters: parent.statement_counters.clone(),
+			ratelimit_charges: parent.ratelimit_charges.clone(),
+			scan_ratelimit_meter: parent.scan_ratelimit_meter.clone(),
 			matches_context: parent.matches_context.clone(),
-			resource_budget: parent.resource_budget.clone(),
 			rate_limiter: Arc::clone(&parent.rate_limiter),
 			knn_context: parent.knn_context.clone(),
 			config: Arc::clone(&parent.config),
@@ -307,8 +318,9 @@ impl Context {
 			new_planner_strategy: parent.new_planner_strategy,
 			redact_volatile_explain_attrs: parent.redact_volatile_explain_attrs,
 			statement_counters: parent.statement_counters.clone(),
+			ratelimit_charges: parent.ratelimit_charges.clone(),
+			scan_ratelimit_meter: parent.scan_ratelimit_meter.clone(),
 			matches_context: parent.matches_context.clone(),
-			resource_budget: parent.resource_budget.clone(),
 			rate_limiter: Arc::clone(&parent.rate_limiter),
 			knn_context: parent.knn_context.clone(),
 			config: Arc::clone(&parent.config),
@@ -370,8 +382,9 @@ impl Context {
 			new_planner_strategy: from.new_planner_strategy,
 			redact_volatile_explain_attrs: from.redact_volatile_explain_attrs,
 			statement_counters: from.statement_counters.clone(),
+			ratelimit_charges: from.ratelimit_charges.clone(),
+			scan_ratelimit_meter: from.scan_ratelimit_meter.clone(),
 			matches_context: from.matches_context.clone(),
-			resource_budget: from.resource_budget.clone(),
 			rate_limiter: Arc::clone(&from.rate_limiter),
 			knn_context: from.knn_context.clone(),
 			config: Arc::clone(&from.config),
@@ -424,8 +437,9 @@ impl Context {
 			new_planner_strategy: from.new_planner_strategy,
 			redact_volatile_explain_attrs: from.redact_volatile_explain_attrs,
 			statement_counters: from.statement_counters.clone(),
+			ratelimit_charges: from.ratelimit_charges.clone(),
+			scan_ratelimit_meter: from.scan_ratelimit_meter.clone(),
 			matches_context: from.matches_context.clone(),
-			resource_budget: from.resource_budget.clone(),
 			rate_limiter: Arc::clone(&from.rate_limiter),
 			knn_context: from.knn_context.clone(),
 			config: Arc::clone(&from.config),
@@ -488,8 +502,9 @@ impl Context {
 			new_planner_strategy: planner_strategy,
 			redact_volatile_explain_attrs: false,
 			statement_counters: None,
+			ratelimit_charges: None,
+			scan_ratelimit_meter: None,
 			matches_context: None,
-			resource_budget: None,
 			rate_limiter,
 			knn_context: None,
 			config,
@@ -537,8 +552,9 @@ impl Context {
 			new_planner_strategy: NewPlannerStrategy::default(),
 			redact_volatile_explain_attrs: false,
 			statement_counters: None,
+			ratelimit_charges: None,
+			scan_ratelimit_meter: None,
 			matches_context: None,
-			resource_budget: None,
 			rate_limiter: Arc::new(RateLimiter::default()),
 			knn_context: None,
 			config: Default::default(),
@@ -560,24 +576,9 @@ impl Context {
 		}
 	}
 
-	/// Returns the shared resource budget for this context, if one is installed.
-	pub(crate) fn resource_budget(&self) -> Option<&Arc<ResourceBudget>> {
-		self.resource_budget.as_ref()
-	}
-
 	/// Returns the shared admission limiter for schema-defined rate limits.
 	pub(crate) fn rate_limiter(&self) -> &Arc<RateLimiter> {
 		&self.rate_limiter
-	}
-
-	/// Installs a shared resource budget on this context.
-	pub(crate) fn set_resource_budget(&mut self, budget: Arc<ResourceBudget>) {
-		self.resource_budget = Some(budget);
-	}
-
-	/// Replaces the shared resource budget on this context.
-	pub(crate) fn set_resource_budget_opt(&mut self, budget: Option<Arc<ResourceBudget>>) {
-		self.resource_budget = budget;
 	}
 
 	/// Freezes this context, allowing it to be used as a parent context.
@@ -861,6 +862,39 @@ impl Context {
 	/// from the iterator's record-result path.
 	pub(crate) fn statement_counters(&self) -> Option<&Arc<StatementCounters>> {
 		self.statement_counters.as_ref()
+	}
+
+	/// Install the per-statement rate-limit charge accumulator. Called by
+	/// the executor before each top-level statement; field-level RATELIMIT
+	/// clauses append to it during document processing and the executor
+	/// settles the total in a dedicated charge transaction afterwards.
+	pub(crate) fn set_ratelimit_charges(
+		&mut self,
+		charges: Option<Arc<std::sync::Mutex<Vec<crate::gov::PendingCharge>>>>,
+	) {
+		self.ratelimit_charges = charges;
+	}
+
+	/// The per-statement rate-limit charge accumulator, if one is installed.
+	pub(crate) fn ratelimit_charges(
+		&self,
+	) -> Option<&Arc<std::sync::Mutex<Vec<crate::gov::PendingCharge>>>> {
+		self.ratelimit_charges.as_ref()
+	}
+
+	/// Install (or clear) the per-statement scan meter. Called by the
+	/// executor around each top-level statement with SELECT rate limits.
+	pub(crate) fn set_scan_ratelimit_meter(
+		&mut self,
+		meter: Option<Arc<crate::gov::ScanRatelimitMeter>>,
+	) {
+		self.scan_ratelimit_meter = meter;
+	}
+
+	/// The per-statement scan meter, if one is installed. Consulted from
+	/// the scan paths of both execution engines.
+	pub(crate) fn scan_ratelimit_meter(&self) -> Option<&Arc<crate::gov::ScanRatelimitMeter>> {
+		self.scan_ratelimit_meter.as_ref()
 	}
 
 	pub(crate) fn tx(&self) -> Arc<Transaction> {
@@ -1496,42 +1530,14 @@ mod tests {
 	}
 
 	#[test]
-	fn context_budget_is_shared_with_children_and_snapshots() {
+	fn context_limiter_is_shared_with_background_work() {
 		use std::sync::Arc;
 
-		use crate::gov::{ResourceBudget, ResourceKind as GovResourceKind};
-
-		let budget = Arc::new(ResourceBudget::monitor(Default::default()));
-		let mut ctx = Context::new_test();
-		ctx.set_resource_budget(Arc::clone(&budget));
-		let root = ctx.freeze();
-
-		root.resource_budget().unwrap().charge(GovResourceKind::ResultRow, 1).unwrap();
-
-		let child = Context::new_child(&root).freeze();
-		child.resource_budget().unwrap().charge(GovResourceKind::ResultRow, 2).unwrap();
-
-		let snapshot = Context::snapshot(&child).freeze();
-		snapshot.resource_budget().unwrap().charge(GovResourceKind::ResultRow, 3).unwrap();
-
-		assert_eq!(budget.usage().get(GovResourceKind::ResultRow), 6);
-	}
-
-	#[test]
-	fn context_budget_and_limiter_are_shared_with_background_work() {
-		use std::sync::Arc;
-
-		use crate::gov::{ResourceBudget, ResourceKind as GovResourceKind};
-
-		let budget = Arc::new(ResourceBudget::monitor(Default::default()));
-		let mut ctx = Context::new_test();
-		ctx.set_resource_budget(Arc::clone(&budget));
+		let ctx = Context::new_test();
 		let limiter = Arc::clone(ctx.rate_limiter());
 
 		let background = Context::background(&ctx).freeze();
-		background.resource_budget().unwrap().charge(GovResourceKind::ResultRow, 7).unwrap();
 
-		assert_eq!(budget.usage().get(GovResourceKind::ResultRow), 7);
 		assert!(Arc::ptr_eq(&limiter, background.rate_limiter()));
 	}
 

@@ -223,6 +223,7 @@ pub(crate) fn kv_scan_stream(
 	pre_skip: usize,
 	limit_hint: Option<u32>,
 	pre_decode_filter: Option<Arc<PreDecodeFilter>>,
+	scan_meter: Option<Arc<crate::gov::ScanRatelimitMeter>>,
 ) -> ValueBatchStream {
 	let skip = pre_skip.min(u32::MAX as usize) as u32;
 	let stream = async_stream::try_stream! {
@@ -259,6 +260,13 @@ pub(crate) fn kv_scan_stream(
 				.context("Failed to scan record")?;
 			if batch.is_empty() {
 				break;
+			}
+			// Meter raw scanned rows against the statement's SELECT rate
+			// limits, before the pre-decode filter: the storage read has
+			// already happened, so filtered-out rows are still cost.
+			// Reservation-ahead: denies mid-scan when the budget runs out.
+			if let Some(meter) = &scan_meter {
+				meter.consume(batch.len() as u64).await?;
 			}
 			let mut decoded = Vec::with_capacity(batch.len());
 			// Hoist the pre-decode-filter branch out of the per-item loop:

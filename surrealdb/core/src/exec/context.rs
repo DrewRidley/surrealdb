@@ -28,7 +28,6 @@ use crate::dbs::{Capabilities, Options};
 use crate::err::Error;
 use crate::exec::function::FunctionRegistry;
 use crate::expr::Base;
-use crate::gov::ResourceBudget;
 use crate::iam::{Action, Auth, ResourceKind};
 use crate::kvs::index::filter_online_indexes;
 use crate::kvs::{Datastore, Transaction};
@@ -736,11 +735,6 @@ impl ExecutionContext {
 	/// Get the cancellation token.
 	pub fn cancellation(&self) -> &CancellationToken {
 		&self.root().cancellation
-	}
-
-	/// Get the shared resource budget for this execution, if one is installed.
-	pub fn resource_budget(&self) -> Option<&Arc<ResourceBudget>> {
-		self.root().ctx.resource_budget()
 	}
 
 	/// Get the legacy Options (if available).

@@ -1,13 +1,9 @@
-//! Resource governance primitives for admission, query budgets, and usage accounting.
-//!
-//! This module is intentionally small at first: it provides the budget spine that can be
-//! threaded through `Context`, the 3.0 execution contexts, server admission, and nested
-//! Surrealism host calls without changing query behaviour while disabled.
+//! Resource governance primitives for schema-defined rate-limit admission.
 
-mod budget;
 mod ratelimit;
-mod usage;
 
-pub use budget::{ChargeOutcome, EnforcementMode, ResourceBudget, ResourceLimits};
-pub(crate) use ratelimit::{CachedRatelimitPolicy, FastRatelimitBucket, RateLimiter, StableHasher};
-pub use usage::{ResourceKind, ResourceUsageSnapshot};
+pub(crate) use ratelimit::{
+	BucketKey, BucketKeyHasher, CachedRatelimitPolicy, ChargeOutcome, ChargeSession,
+	FastRatelimitBucket, PendingCharge, PlanIdentity, RateLimiter, ScanRatelimitMeter,
+	StableHasher,
+};

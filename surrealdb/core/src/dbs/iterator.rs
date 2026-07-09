@@ -832,11 +832,6 @@ impl Iterator {
 	}
 
 	#[inline]
-	pub(super) fn cancel(&self) {
-		self.canceller.cancel();
-	}
-
-	#[inline]
 	pub(crate) async fn setup_limit(
 		&mut self,
 		stk: &mut Stk,

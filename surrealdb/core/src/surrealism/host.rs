@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::ops::Bound;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -17,7 +16,6 @@ use crate::dbs::capabilities::{Capabilities, FuncTarget, NetTarget, Targets};
 use crate::doc::CursorDoc;
 use crate::expr::function::Function;
 use crate::expr::{Expr, FlowResultExt, FunctionCall, Model};
-use crate::gov::ResourceKind;
 #[cfg(feature = "http")]
 use crate::http::HttpClient;
 use crate::syn;
@@ -53,10 +51,7 @@ impl Host {
 			ctx: Arc::clone(ctx),
 			opt: opt.clone(),
 			doc: doc.cloned(),
-			kv: Arc::new(ChargingKvStore {
-				inner: kv,
-				ctx: Arc::clone(ctx),
-			}),
+			kv,
 			module_name,
 			#[cfg(feature = "http")]
 			http_client,
@@ -78,103 +73,6 @@ impl Host {
 			#[cfg(feature = "http")]
 			Arc::clone(&self.http_client),
 		)
-	}
-
-	fn charge_host_call(&self, kind: ResourceKind) -> Result<()> {
-		if let Some(budget) = self.ctx.resource_budget() {
-			budget.charge(kind, 1)?;
-		}
-		Ok(())
-	}
-}
-
-struct ChargingKvStore {
-	inner: Arc<BTreeMapStore>,
-	ctx: FrozenContext,
-}
-
-impl ChargingKvStore {
-	fn charge(&self, kind: ResourceKind, amount: u64) -> Result<()> {
-		if let Some(budget) = self.ctx.resource_budget() {
-			budget.charge(kind, amount)?;
-		}
-		Ok(())
-	}
-}
-
-#[async_trait]
-impl KVStore for ChargingKvStore {
-	async fn get(&self, key: String) -> Result<Option<surrealdb_types::Value>> {
-		self.charge(ResourceKind::ModuleHostKvRead, 1)?;
-		self.inner.get(key).await
-	}
-
-	async fn set(&self, key: String, value: surrealdb_types::Value) -> Result<()> {
-		self.charge(ResourceKind::ModuleHostKvWrite, 1)?;
-		self.inner.set(key, value).await
-	}
-
-	async fn del(&self, key: String) -> Result<()> {
-		self.charge(ResourceKind::ModuleHostKvWrite, 1)?;
-		self.inner.del(key).await
-	}
-
-	async fn exists(&self, key: String) -> Result<bool> {
-		self.charge(ResourceKind::ModuleHostKvRead, 1)?;
-		self.inner.exists(key).await
-	}
-
-	async fn del_rng(&self, start: Bound<String>, end: Bound<String>) -> Result<()> {
-		let count = self.inner.count(start.clone(), end.clone()).await?;
-		self.charge(ResourceKind::ModuleHostKvWrite, count.max(1))?;
-		self.inner.del_rng(start, end).await
-	}
-
-	async fn get_batch(&self, keys: Vec<String>) -> Result<Vec<Option<surrealdb_types::Value>>> {
-		self.charge(ResourceKind::ModuleHostKvRead, (keys.len() as u64).max(1))?;
-		self.inner.get_batch(keys).await
-	}
-
-	async fn set_batch(&self, entries: Vec<(String, surrealdb_types::Value)>) -> Result<()> {
-		self.charge(ResourceKind::ModuleHostKvWrite, (entries.len() as u64).max(1))?;
-		self.inner.set_batch(entries).await
-	}
-
-	async fn del_batch(&self, keys: Vec<String>) -> Result<()> {
-		self.charge(ResourceKind::ModuleHostKvWrite, (keys.len() as u64).max(1))?;
-		self.inner.del_batch(keys).await
-	}
-
-	async fn keys(&self, start: Bound<String>, end: Bound<String>) -> Result<Vec<String>> {
-		let keys = self.inner.keys(start, end).await?;
-		self.charge(ResourceKind::ModuleHostKvRead, (keys.len() as u64).max(1))?;
-		Ok(keys)
-	}
-
-	async fn values(
-		&self,
-		start: Bound<String>,
-		end: Bound<String>,
-	) -> Result<Vec<surrealdb_types::Value>> {
-		let values = self.inner.values(start, end).await?;
-		self.charge(ResourceKind::ModuleHostKvRead, (values.len() as u64).max(1))?;
-		Ok(values)
-	}
-
-	async fn entries(
-		&self,
-		start: Bound<String>,
-		end: Bound<String>,
-	) -> Result<Vec<(String, surrealdb_types::Value)>> {
-		let entries = self.inner.entries(start, end).await?;
-		self.charge(ResourceKind::ModuleHostKvRead, (entries.len() as u64).max(1))?;
-		Ok(entries)
-	}
-
-	async fn count(&self, start: Bound<String>, end: Bound<String>) -> Result<u64> {
-		let count = self.inner.count(start, end).await?;
-		self.charge(ResourceKind::ModuleHostKvRead, count.max(1))?;
-		Ok(count)
 	}
 }
 
@@ -250,8 +148,6 @@ impl InvocationContext for Host {
 		query: String,
 		vars: PublicObject,
 	) -> Result<PublicValue> {
-		self.charge_host_call(ResourceKind::ModuleHostSqlCall)?;
-
 		if !config.capabilities.allow_arbitrary_queries {
 			bail!("Module does not have the 'allow_arbitrary_queries' capability");
 		}
@@ -282,8 +178,6 @@ impl InvocationContext for Host {
 		version: Option<String>,
 		args: Vec<PublicValue>,
 	) -> Result<PublicValue> {
-		self.charge_host_call(ResourceKind::ModuleHostFunctionCall)?;
-
 		if !config.capabilities.allow_functions.allows(&fnc) {
 			bail!("Module is not allowed to call function '{fnc}'");
 		}

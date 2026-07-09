@@ -177,7 +177,6 @@ keyword! {
 	Replace => "REPLACE",
 	Retry => "RETRY",
 	Return => "RETURN",
-	Result => "RESULT",
 	Revoke => "REVOKE",
 	Revoked => "REVOKED",
 	Roles => "ROLES",

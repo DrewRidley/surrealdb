@@ -44,6 +44,15 @@ fn is_identifier_token(parser: &Parser<'_>, token: Token, ident: &str) -> bool {
 }
 
 impl Parser<'_> {
+	fn parse_optional_ratelimit_max(&mut self) -> ParseResult<Option<u64>> {
+		let token = self.peek();
+		if !is_identifier_token(self, token, "MAX") {
+			return Ok(None);
+		}
+		self.pop_peek();
+		Ok(Some(self.next_token_value::<u64>()?))
+	}
+
 	async fn parse_ratelimits(
 		&mut self,
 		stk: &mut Stk,
@@ -66,25 +75,6 @@ impl Parser<'_> {
 		stk: &mut Stk,
 		allow_delete: bool,
 	) -> ParseResult<RateLimit> {
-		if self.eat(t!("SCAN")) {
-			if !allow_delete {
-				bail!("Can't define rate limit SCAN for fields", @self.last_span());
-			}
-			let scan = self.next_token_value::<u64>()?;
-			expected!(self, t!("PER"));
-			let period = self.next_token_value::<PublicDuration>()?;
-			return Ok(RateLimit {
-				actions: Vec::new(),
-				condition: None,
-				bucket: Expr::Literal(Literal::None),
-				limit: scan,
-				period,
-				scan: Some(scan),
-				scan_period: Some(period),
-				result: None,
-			});
-		}
-
 		let mut actions = Vec::new();
 		loop {
 			let token = self.next();
@@ -94,11 +84,7 @@ impl Parser<'_> {
 				t!("UPDATE") => PermissionKind::Update,
 				t!("DELETE") if allow_delete => PermissionKind::Delete,
 				t!("DELETE") => unexpected!(self, token, "one of `SELECT`, `CREATE` or `UPDATE`"),
-				_ => unexpected!(
-					self,
-					token,
-					"one of `SELECT`, `CREATE`, `UPDATE`, `DELETE` or `SCAN`"
-				),
+				_ => unexpected!(self, token, "one of `SELECT`, `CREATE`, `UPDATE` or `DELETE`"),
 			};
 			actions.push(action);
 			if !self.eat(t!(",")) {
@@ -119,20 +105,7 @@ impl Parser<'_> {
 		let limit = self.next_token_value::<u64>()?;
 		expected!(self, t!("PER"));
 		let period = self.next_token_value::<PublicDuration>()?;
-
-		let (scan, scan_period) = if self.eat(t!("SCAN")) {
-			let scan = self.next_token_value::<u64>()?;
-			expected!(self, t!("PER"));
-			let period = self.next_token_value::<PublicDuration>()?;
-			(Some(scan), Some(period))
-		} else {
-			(None, None)
-		};
-		let result = if self.eat(t!("RESULT")) {
-			Some(self.next_token_value::<u64>()?)
-		} else {
-			None
-		};
+		let max = self.parse_optional_ratelimit_max()?;
 
 		Ok(RateLimit {
 			actions,
@@ -140,9 +113,7 @@ impl Parser<'_> {
 			bucket,
 			limit,
 			period,
-			scan,
-			scan_period,
-			result,
+			max,
 		})
 	}
 

@@ -9,7 +9,6 @@ use crate::catalog::providers::TableProvider;
 use crate::catalog::{DatabaseId, NamespaceId};
 use crate::exec::{ControlFlowExt, EvalContext, ExecutionContext, PhysicalExpr};
 use crate::expr::ControlFlow;
-use crate::gov::{ChargeOutcome, ResourceBudget, ResourceKind as GovResourceKind};
 use crate::kvs::{CachePolicy, Transaction};
 use crate::val::{RecordId, RecordIdKey, Value};
 
@@ -19,28 +18,6 @@ use crate::val::{RecordId, RecordIdKey, Value};
 /// `SURREAL_SCAN_BATCH_SIZE`); this constant exists only as the
 /// documentation anchor for that default.
 pub(crate) const DEFAULT_SCAN_BATCH_SIZE: usize = 1000;
-
-/// Charge a batch read from a scan source to the active resource budget.
-///
-/// `ScanKey` records how much storage/index scan space the operator consumed;
-/// `RowRead` records how many candidate rows entered execution before
-/// permission and predicate filtering.
-pub(crate) fn charge_scanned_batch(
-	budget: Option<&Arc<ResourceBudget>>,
-	row_count: usize,
-) -> anyhow::Result<ChargeOutcome> {
-	let Some(budget) = budget else {
-		return Ok(ChargeOutcome::Charged);
-	};
-	let rows = row_count as u64;
-	let outcome = budget.charge_or_truncate(GovResourceKind::ScanKey, rows)?;
-	let row_reads = match outcome {
-		ChargeOutcome::Charged => rows,
-		ChargeOutcome::Truncated(_, allowed) => allowed,
-	};
-	budget.charge(GovResourceKind::RowRead, row_reads)?;
-	Ok(outcome)
-}
 
 /// Convert a [`Value`] to a [`RecordIdKey`] for use in key range construction.
 ///
@@ -203,6 +180,14 @@ pub(crate) async fn resolve_record_batch(
 		.await
 		.context("Failed to fetch records")?;
 
+	// Meter fetched records against the statement's SELECT rate limits.
+	// This is the shared choke point for graph/reference target fetches,
+	// so every plan shape pays the same cost per record read.
+	if let Some(meter) = ctx.ctx().scan_ratelimit_meter() {
+		let found = records.iter().filter(|record| record.data.is_some()).count() as u64;
+		meter.consume(found).await.map_err(ControlFlow::from)?;
+	}
+
 	let mut values = Vec::with_capacity(rids.len());
 	for (rid, record) in rids.iter().zip(records) {
 		// Missing records cannot disclose information.
@@ -265,6 +250,13 @@ pub(crate) async fn fetch_and_filter_records_batch(
 		.await
 		.context("Failed to fetch records")?;
 
+	// Meter fetched records against the statement's SELECT rate limits
+	// (shared by the index, fulltext, and KNN scan target fetches).
+	if let Some(meter) = ctx.ctx().scan_ratelimit_meter() {
+		let found = records.iter().filter(|record| record.data.is_some()).count() as u64;
+		meter.consume(found).await.map_err(ControlFlow::from)?;
+	}
+
 	let mut values = Vec::with_capacity(rids.len());
 	for record in records {
 		if record.data.is_none() {
@@ -297,40 +289,4 @@ pub(crate) async fn fetch_and_filter_records_batch(
 		values.push(value);
 	}
 	Ok(values)
-}
-
-#[cfg(test)]
-mod tests {
-	use std::sync::Arc;
-
-	use super::charge_scanned_batch;
-	use crate::gov::{ChargeOutcome, ResourceBudget, ResourceKind, ResourceLimits};
-
-	#[test]
-	fn charge_scanned_batch_accounts_scan_and_row_reads() {
-		let budget = Arc::new(ResourceBudget::monitor(ResourceLimits::default()));
-
-		assert_eq!(charge_scanned_batch(Some(&budget), 3).unwrap(), ChargeOutcome::Charged);
-
-		let usage = budget.usage();
-		assert_eq!(usage.get(ResourceKind::ScanKey), 3);
-		assert_eq!(usage.get(ResourceKind::RowRead), 3);
-	}
-
-	#[test]
-	fn charge_scanned_batch_truncates_on_scan_limit() {
-		let budget = Arc::new(ResourceBudget::enforcing(
-			ResourceLimits::default().with_limit(ResourceKind::ScanKey, 2),
-		));
-		budget.set_truncation_allowed(true);
-
-		assert_eq!(
-			charge_scanned_batch(Some(&budget), 3).unwrap(),
-			ChargeOutcome::Truncated(ResourceKind::ScanKey, 2)
-		);
-		assert_eq!(budget.truncated_kind(), Some(ResourceKind::ScanKey));
-		let usage = budget.usage();
-		assert_eq!(usage.get(ResourceKind::ScanKey), 3);
-		assert_eq!(usage.get(ResourceKind::RowRead), 2);
-	}
 }
