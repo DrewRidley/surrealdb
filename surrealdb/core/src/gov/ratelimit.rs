@@ -793,7 +793,7 @@ mod tests {
 				let mut admitted = 0;
 				for _ in 0..8 {
 					match limiter
-						.charge(&ds.ratelimit_charge_session(None), &[charge.clone()])
+						.charge(&ds.ratelimit_charge_session(None), std::slice::from_ref(&charge))
 						.await
 					{
 						Ok(ChargeOutcome::Admitted) => admitted += 1,
